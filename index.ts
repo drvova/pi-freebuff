@@ -9,7 +9,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { startProxy, stopProxy, PROXY_SECRET, setProxyCredentials } from "./proxy";
-import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runDeviceCodeLogin, runManualTokenLogin, registerUser, type PersistedCredentials } from "./oauth";
+import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runDeviceCodeLogin, registerUser, type PersistedCredentials } from "./oauth";
 import { clearCachedToken } from "./auth";
 import { clearSessionIds } from "./chat";
 import { getAllModels, getCachedCatalog, clearCachedCatalog, type ModelCatalogEntry } from "./catalog";
@@ -60,13 +60,7 @@ async function buildDynamicModels(apiKey: string, backendUrl: string): Promise<R
 
 // OAuth
 async function loginFreebuff(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  let token: string;
-  try {
-    token = await runDeviceCodeLogin(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
-  } catch {
-    // Fallback: manual token paste
-    token = await runManualTokenLogin(DEFAULT_REGION, (msg) => callbacks.onPrompt(msg));
-  }
+  const token = await runDeviceCodeLogin(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
   if (!token) throw new Error("No token received.");
 
   const result = await registerUser(token, DEFAULT_REGION);
