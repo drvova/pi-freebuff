@@ -143,7 +143,7 @@ async function fetchCatalog(
           }
         }
       }
-    };
+    });
 
     ws.addEventListener("error", () => {
       clearTimeout(timer);
