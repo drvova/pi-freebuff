@@ -113,15 +113,10 @@ function getFingerprintHash(fingerprintString: string): string {
 // ----------------------------------------------------------------------------
 
 interface DeviceCodeResponse {
-  device_code?: string;
-  user_code?: string;
-  verification_url?: string;
-  verificationUri?: string;
-  verification_uri_complete?: string;
-  expires_in?: number;
-  interval?: number;
-  url?: string;
-  code?: string;
+  fingerprintId: string;
+  fingerprintHash: string;
+  loginUrl: string;
+  expiresAt: number;
 }
 
 export async function runLoginLoopback(
@@ -151,30 +146,26 @@ export async function runLoginLoopback(
   const codeData: DeviceCodeResponse = await codeRes.json();
   console.error("[freebuff] device code response:", JSON.stringify(codeData).slice(0, 200));
 
-  const verificationUrl = codeData.verification_url
-    ?? codeData.verificationUri
-    ?? codeData.verification_uri_complete
-    ?? codeData.url
-    ?? `${region.website}/auth/cli?user_code=${codeData.user_code ?? codeData.code}`;
+  const verificationUrl = codeData.loginUrl;
+  const fpHash = codeData.fingerprintHash;
+  const expiresAt = codeData.expiresAt;
 
   // Step 2: Open browser
   onUrl(verificationUrl);
   await openBrowser(verificationUrl).catch(() => {});
 
   // Step 3: Poll for completion
-  const expiresAt = Date.now() + (codeData.expires_in ?? 300) * 1000;
-  const intervalSec = codeData.interval ?? 5;
   const deadline = Date.now() + 10 * 60 * 1000;
 
   console.error(`[freebuff] waiting for sign-in at: ${verificationUrl}`);
-  console.error(`[freebuff] polling every ${intervalSec}s...`);
+  console.error(`[freebuff] polling every 5s...`);
 
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error("Sign-in cancelled.");
 
-    await sleep(intervalSec * 1000);
+    await sleep(5000);
 
-    const statusUrl = `${region.website}/api/auth/cli/status?fingerprintId=${encodeURIComponent(fingerprintId)}&fingerprintHash=${encodeURIComponent(fingerprintHash)}&expiresAt=${expiresAt}`;
+    const statusUrl = `${region.website}/api/auth/cli/status?fingerprintId=${encodeURIComponent(fingerprintId)}&fingerprintHash=${encodeURIComponent(fpHash)}&expiresAt=${expiresAt}`;
 
     try {
       const statusRes = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
@@ -193,7 +184,6 @@ export async function runLoginLoopback(
       }
     } catch (e) {
       if (signal?.aborted) throw new Error("Sign-in cancelled.");
-      // Keep polling on transient errors
     }
   }
 
