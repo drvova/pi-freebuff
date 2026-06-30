@@ -88,6 +88,22 @@ function contentToText(content: ChatMessage["content"]): string {
   }).join("");
 }
 
+// Pass reasoning_content through from assistant messages (required by thinking models)
+function buildMessage(m: ChatMessage): Record<string, unknown> {
+  const msg: Record<string, unknown> = {
+    role: m.role === "developer" ? "system" : m.role,
+    content: contentToText(m.content),
+  };
+  if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+  if (m.tool_calls) msg.tool_calls = m.tool_calls;
+  // Preserve reasoning_content if present (thinking models like deepseek require this)
+  const raw = m as Record<string, unknown>;
+  if (raw.reasoning_content && m.role === "assistant") {
+    msg.reasoning_content = raw.reasoning_content;
+  }
+  return msg;
+}
+
 // ---- HTTP helpers ----
 
 const API_BASE = DEFAULT_REGION.api;
@@ -203,12 +219,7 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   // Map 'developer' → 'system' (Codebuff only supports system/user/assistant/tool)
   const messages = [
     { role: "system" as const, content: BUFFY_SYSTEM_PROMPT },
-    ...req.messages.map((m) => ({
-      role: m.role === "developer" ? ("system" as const) : m.role,
-      content: contentToText(m.content),
-      ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
-      ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
-    })),
+    ...req.messages.map(buildMessage),
   ];
 
   const body: Record<string, unknown> = {
