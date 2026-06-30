@@ -152,3 +152,6 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
     if (!finished) { req.callbacks.onError?.(err); throw err; }
   }
 }
+
+// No-op: REST API has no persistent connections to clear
+export function clearSessionIds(): void {}
