@@ -8,10 +8,10 @@
  */
 
 import * as http from "http";
-import * as crypto = require("crypto");
-import * as fs = require("fs");
-import * as path = require("path");
-import * as os = require("os");
+import * as crypto from "crypto";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 import { spawn } from "child_process";
 
 // ----------------------------------------------------------------------------
