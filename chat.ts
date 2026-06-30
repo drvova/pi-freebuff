@@ -5,10 +5,11 @@
  * Flow per request:
  *   1. Reuse cached session (or POST /api/v1/freebuff/session to create)
  *   2. POST /api/v1/agent-runs {action:'START', agentId} — get runId
- *   3. POST /api/v1/chat/completions — send with runId
+ *   3. POST /api/v1/chat/completions — send with runId + instanceId + Buffy prompt
  *   4. POST /api/v1/agent-runs {action:'FINISH', runId} — finish
  *
  * Sessions are cached and reused to avoid 429 rate limits.
+ * The Buffy system prompt and freebuff_instance_id are required by the API.
  */
 
 import * as crypto from "crypto";
@@ -54,6 +55,10 @@ export class CloudChatError extends Error {
   }
 }
 
+// ---- Buffy system prompt (required by Codebuff API) ----
+
+const BUFFY_SYSTEM_PROMPT = `You are Buffy, a strategic assistant that orchestrates complex coding tasks through specialized sub-agents. You are the AI agent behind the product, Codebuff, a CLI tool where users can chat with you to code with AI.\n\nCurrent date: ${new Date().toISOString().split("T")[0]}.\n\n# Core Mandates\n\n- **Tone:** Adopt a professional, direct, and concise tone suitable for a CLI environment.\n- **Understand first, act second:** Always gather context and read relevant files BEFORE editing files.\n- **Quality over speed:** Prioritize correctness over appearing productive. Fewer, well-informed agents are better than many rushed ones.\n- **Spawn mentioned agents:** If the user uses a specific agent name (e.g. "researcher", "writer"), spawn that agent with the appropriate prompt.`;
+
 // ---- Model → Agent mapping (from freebuff free-agents.ts) ----
 
 const MODEL_TO_AGENT: Record<string, string> = {
@@ -88,7 +93,7 @@ function contentToText(content: ChatMessage["content"]): string {
 const API_BASE = DEFAULT_REGION.api;
 const UA = "Bun/1.3.11";
 
-async function apiPost(path: string, authToken: string, body?: Record<string, unknown>, extraHeaders?: Record<string, string>): Promise<{ status: number; data: unknown }> {
+async function apiPost(path: string, authToken: string, body?: Record<string, unknown>, extraHeaders?: Record<string, string>): Promise<{ status: number; data: Record<string, unknown> }> {
   const headers: Record<string, string> = {
     "authorization": `Bearer ${authToken}`,
     "user-agent": UA,
@@ -103,19 +108,15 @@ async function apiPost(path: string, authToken: string, body?: Record<string, un
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
-  let data: unknown;
-  try { data = JSON.parse(text); } catch { data = text; }
+  let data: Record<string, unknown> = {};
+  try { data = JSON.parse(text) as Record<string, unknown>; } catch {}
   return { status: res.status, data };
 }
 
 async function apiDelete(path: string, authToken: string): Promise<{ status: number }> {
   const res = await fetch(`${API_BASE}${path}`, {
     method: "DELETE",
-    headers: {
-      "authorization": `Bearer ${authToken}`,
-      "user-agent": UA,
-      "accept": "application/json",
-    },
+    headers: { "authorization": `Bearer ${authToken}`, "user-agent": UA, "accept": "application/json" },
   });
   return { status: res.status };
 }
@@ -124,28 +125,26 @@ async function apiDelete(path: string, authToken: string): Promise<{ status: num
 
 interface CachedSession {
   model: string;
+  instanceId: string;
   createdAt: number;
 }
 
 const sessionCache = new Map<string, CachedSession>();
-const SESSION_TTL_MS = 30 * 60_000; // 30 min
+const SESSION_TTL_MS = 30 * 60_000;
 
-async function ensureSession(authToken: string, model: string): Promise<void> {
+async function ensureSession(authToken: string, model: string): Promise<string> {
   const cached = sessionCache.get(authToken);
   if (cached && cached.model === model && Date.now() - cached.createdAt < SESSION_TTL_MS) {
-    return; // Reuse existing session
+    return cached.instanceId;
   }
 
-  // End old session if switching models
   if (cached && cached.model !== model) {
     await apiDelete("/api/v1/freebuff/session", authToken).catch(() => {});
     sessionCache.delete(authToken);
   }
 
-  // Create new session
-  const { status } = await apiPost("/api/v1/freebuff/session", authToken, undefined, { "x-freebuff-model": model });
+  const { status, data } = await apiPost("/api/v1/freebuff/session", authToken, undefined, { "x-freebuff-model": model });
   if (status < 200 || status >= 300) {
-    // 429 = rate limited, wait and retry once
     if (status === 429) {
       console.error("[freebuff] session 429, waiting 5s...");
       await new Promise(r => setTimeout(r, 5000));
@@ -153,12 +152,16 @@ async function ensureSession(authToken: string, model: string): Promise<void> {
       if (retry.status < 200 || retry.status >= 300) {
         throw new CloudChatError(`create session failed: HTTP ${retry.status}`, "session_error", retry.status);
       }
-    } else {
-      throw new CloudChatError(`create session failed: HTTP ${status}`, "session_error", status);
+      const instanceId = (retry.data.instanceId as string) ?? "";
+      sessionCache.set(authToken, { model, instanceId, createdAt: Date.now() });
+      return instanceId;
     }
+    throw new CloudChatError(`create session failed: HTTP ${status}`, "session_error", status);
   }
 
-  sessionCache.set(authToken, { model, createdAt: Date.now() });
+  const instanceId = (data.instanceId as string) ?? "";
+  sessionCache.set(authToken, { model, instanceId, createdAt: Date.now() });
+  return instanceId;
 }
 
 // ---- Run lifecycle ----
@@ -168,7 +171,7 @@ async function startRun(authToken: string, agentId: string): Promise<string> {
   if (status < 200 || status >= 300) {
     throw new CloudChatError(`start run failed: HTTP ${status}`, "run_error", status);
   }
-  const runId = (data as { runId?: string })?.runId ?? "";
+  const runId = (data.runId as string) ?? "";
   if (!runId) throw new CloudChatError(`start run missing runId: ${JSON.stringify(data)}`, "run_error");
   return runId;
 }
@@ -188,26 +191,32 @@ async function finishRun(authToken: string, runId: string): Promise<void> {
 export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   const agentId = agentForModel(req.modelUid);
 
-  // 1. Ensure session (cached or create new)
-  await ensureSession(req.apiKey, req.modelUid);
+  // 1. Ensure session → get instanceId
+  const instanceId = await ensureSession(req.apiKey, req.modelUid);
 
   // 2. Start run → get runId
   const runId = await startRun(req.apiKey, agentId);
 
-  // 3. Build chat completion body
-  const body: Record<string, unknown> = {
-    model: req.modelUid,
-    messages: req.messages.map((m) => ({
+  // 3. Build messages with Buffy system prompt prepended
+  const messages = [
+    { role: "system" as const, content: BUFFY_SYSTEM_PROMPT },
+    ...req.messages.map((m) => ({
       role: m.role,
       content: contentToText(m.content),
       ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
       ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
     })),
+  ];
+
+  const body: Record<string, unknown> = {
+    model: req.modelUid,
+    messages,
     stream: true,
     codebuff_metadata: {
       run_id: runId,
       cost_mode: "free",
       client_id: crypto.randomUUID(),
+      freebuff_instance_id: instanceId,
     },
   };
   if (req.tools && req.tools.length > 0) body.tools = req.tools;
@@ -297,10 +306,8 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   } catch (err) {
     if (!finished) { req.callbacks.onError?.(err); throw err; }
   } finally {
-    // 5. Finish run (best-effort)
     await finishRun(req.apiKey, runId).catch(() => {});
   }
 }
 
-// No-op: REST API has no persistent connections to clear
-export function clearSessionIds(): void {}
+export function clearSessionIds(): void { sessionCache.clear(); }
