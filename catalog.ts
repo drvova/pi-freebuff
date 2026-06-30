@@ -23,7 +23,7 @@ export interface ModelCatalogEntry {
 const FREE_AGENTS_SOURCE_URL =
   "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/free-agents.ts";
 
-// ---- Known model variable mappings (from free-agents.ts) ----
+// ---- Known model variable mappings (from freebuff-models.ts) ----
 
 const KNOWN_MODEL_VARS: Record<string, string> = {
   FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID: "deepseek/deepseek-v4-pro",
@@ -34,6 +34,7 @@ const KNOWN_MODEL_VARS: Record<string, string> = {
   FREEBUFF_MINIMAX_M3_MODEL_ID: "minimax/minimax-m3",
   FREEBUFF_MIMO_V25_MODEL_ID: "mimo/mimo-v2.5",
   FREEBUFF_MIMO_V25_PRO_MODEL_ID: "mimo/mimo-v2.5-pro",
+  FREEBUFF_GLM_V52_MODEL_ID: "z-ai/glm-5.2",
 };
 
 const KNOWN_MODEL_SETS: Record<string, string[]> = {
@@ -45,10 +46,19 @@ const KNOWN_MODEL_SETS: Record<string, string[]> = {
     "minimax/minimax-m3",
     "mimo/mimo-v2.5",
     "mimo/mimo-v2.5-pro",
+    "z-ai/glm-5.2",
   ],
 };
 
 // ---- Parsing ----
+
+function resolveVar(value: string): string | null {
+  // Check KNOWN_MODEL_VARS
+  if (KNOWN_MODEL_VARS[value]) return KNOWN_MODEL_VARS[value];
+  // Check KNOWN_MODEL_SETS
+  if (KNOWN_MODEL_SETS[value]) return null; // sets don't resolve to single values
+  return null;
+}
 
 function extractModelsFromSource(source: string): string[] {
   const models = new Set<string>();
@@ -75,6 +85,22 @@ function extractModelsFromSource(source: string): string[] {
     const varName = match[2];
     const knownModels = KNOWN_MODEL_SETS[varName];
     if (knownModels) knownModels.forEach((m) => models.add(m));
+    const modelId = KNOWN_MODEL_VARS[varName];
+    if (modelId) models.add(modelId);
+  }
+
+  // Pattern 3: [VARIABLE]: 'agent-id' — reverse mapping in FREEBUFF_ROOT_AGENT_ID_BY_MODEL
+  const reverseRe = /\[([A-Z_]+)\]:\s*'([^']+)'/g;
+  while ((match = reverseRe.exec(source)) !== null) {
+    const varName = match[1];
+    const modelId = KNOWN_MODEL_VARS[varName];
+    if (modelId) models.add(modelId);
+  }
+
+  // Pattern 4: id: VARIABLE — in FREEBUFF_MODELS array
+  const idRe = /id:\s*([A-Z_]+)/g;
+  while ((match = idRe.exec(source)) !== null) {
+    const varName = match[1];
     const modelId = KNOWN_MODEL_VARS[varName];
     if (modelId) models.add(modelId);
   }
