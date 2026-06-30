@@ -132,10 +132,10 @@ interface CachedSession {
 const sessionCache = new Map<string, CachedSession>();
 const SESSION_TTL_MS = 30 * 60_000;
 
-async function ensureSession(authToken: string, model: string): Promise<string> {
+async function ensureSession(authToken: string, model: string): Promise<{ instanceId: string; sessionModel: string }> {
   const cached = sessionCache.get(authToken);
   if (cached && cached.model === model && Date.now() - cached.createdAt < SESSION_TTL_MS) {
-    return cached.instanceId;
+    return { instanceId: cached.instanceId, sessionModel: cached.model };
   }
 
   if (cached && cached.model !== model) {
@@ -153,15 +153,17 @@ async function ensureSession(authToken: string, model: string): Promise<string> 
         throw new CloudChatError(`create session failed: HTTP ${retry.status}`, "session_error", retry.status);
       }
       const instanceId = (retry.data.instanceId as string) ?? "";
-      sessionCache.set(authToken, { model, instanceId, createdAt: Date.now() });
-      return instanceId;
+      const sessionModel = (retry.data.model as string) ?? model;
+      sessionCache.set(authToken, { model: sessionModel, instanceId, createdAt: Date.now() });
+      return { instanceId, sessionModel };
     }
     throw new CloudChatError(`create session failed: HTTP ${status}`, "session_error", status);
   }
 
   const instanceId = (data.instanceId as string) ?? "";
-  sessionCache.set(authToken, { model, instanceId, createdAt: Date.now() });
-  return instanceId;
+  const sessionModel = (data.model as string) ?? model;
+  sessionCache.set(authToken, { model: sessionModel, instanceId, createdAt: Date.now() });
+  return { instanceId, sessionModel };
 }
 
 // ---- Run lifecycle ----
@@ -191,8 +193,8 @@ async function finishRun(authToken: string, runId: string): Promise<void> {
 export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   const agentId = agentForModel(req.modelUid);
 
-  // 1. Ensure session → get instanceId
-  const instanceId = await ensureSession(req.apiKey, req.modelUid);
+  // 1. Ensure session → get instanceId + sessionModel
+  const { instanceId, sessionModel } = await ensureSession(req.apiKey, req.modelUid);
 
   // 2. Start run → get runId
   const runId = await startRun(req.apiKey, agentId);
@@ -210,7 +212,7 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   ];
 
   const body: Record<string, unknown> = {
-    model: req.modelUid,
+    model: sessionModel,
     messages,
     stream: true,
     codebuff_metadata: {
