@@ -117,8 +117,10 @@ export async function getCachedCatalog(
   if (cached && now - cached.fetchedAt < CATALOG_TTL_MS) return cached;
 
   try {
+    console.error("[freebuff] catalog: fetching from source...");
     const response = await fetch(FREE_AGENTS_SOURCE_URL, {
-      signal: signal ?? AbortSignal.timeout(15_000),
+      signal: signal ?? AbortSignal.timeout(30_000),
+      headers: { "User-Agent": "Mozilla/5.0" },
     });
 
     if (response.ok) {
@@ -128,10 +130,11 @@ export async function getCachedCatalog(
         const byUid = new Map<string, ModelCatalogEntry>();
         for (const id of modelIds) byUid.set(id, modelToEntry(id));
         cached = { byUid, fetchedAt: now };
-        console.error(`[freebuff] catalog: fetched ${modelIds.length} models from source`);
+        console.error(`[freebuff] catalog: fetched ${modelIds.length} models: ${modelIds.join(", ")}`);
         return cached;
       }
     }
+    console.error(`[freebuff] catalog: HTTP ${response.status}`);
   } catch (e) {
     console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
