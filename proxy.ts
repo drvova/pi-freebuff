@@ -7,26 +7,22 @@
  */
 import * as crypto from "crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
-import { streamChatEvents, CloudChatError, type ChatHistoryItem, type ToolDef, type ResponseMeta } from "./chat";
-import { resolveModel, resolveModelSync, getDefaultModel, getCanonicalModels, setCatalog } from "./models";
+import { streamCloudChat, CloudChatError, type ChatMessage, type ToolDefinition, type StreamEvent, type CloudChatRequest } from "./chat";
+import { resolveModel, getDefaultModel, setCatalog } from "./models";
 import { loadCredentials } from "./oauth";
 import { getAllModels, getCachedCatalog, type ModelCatalogEntry } from "./catalog";
 
 const FREEBUFF_PROXY_HOST = "127.0.0.1";
 const FREEBUFF_PROXY_PORT = 42101;
 
-// Per-process secret — same-process callers use this as Bearer token.
 export const PROXY_SECRET: string = crypto.randomBytes(32).toString("hex");
 
-// In-memory credentials cache — set from extension on startup/after login
 export let proxyCredentials: { apiKey: string; backendUrl: string } | null = null;
 export function setProxyCredentials(creds: { apiKey: string; backendUrl: string } | null): void {
   proxyCredentials = creds;
 }
 
-// ----------------------------------------------------------------------------
-// Proxy handler (Node http server)
-// ----------------------------------------------------------------------------
+// ---- Request types ----
 
 interface ChatCompletionRequest {
   model?: string;
@@ -42,58 +38,40 @@ interface ChatCompletionRequest {
   tools?: Array<{ type?: string; function?: { name?: string; description?: string; parameters?: Record<string, unknown> } }>;
 }
 
-function mapMessageToHistoryItem(m: ChatCompletionRequest["messages"][number]): ChatHistoryItem {
-  const item: ChatHistoryItem = {
-    role: m.role as ChatHistoryItem["role"],
-    content: m.content as ChatHistoryItem["content"],
-  };
-  if (m.role === "tool" && typeof m.tool_call_id === "string" && m.tool_call_id.length > 0) {
-    item.tool_call_id = m.tool_call_id;
-  }
-  if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-    item.tool_calls = m.tool_calls
-      .map((tc) => ({
-        id: typeof tc.id === "string" ? tc.id : "",
-        name: typeof tc.function?.name === "string" ? tc.function.name : "",
-        arguments: typeof tc.function?.arguments === "string" ? tc.function.arguments : "",
-      }))
-      .filter((tc) => tc.id !== "" && tc.name !== "");
-  }
-  return item;
+function mapMessage(m: ChatCompletionRequest["messages"][number]): ChatMessage {
+  const content: ChatMessage["content"] = typeof m.content === "string"
+    ? m.content
+    : m.content.map((p) => {
+        if (p.type === "text") return { type: "text", text: p.text ?? "" };
+        if (p.type === "image_url") return { type: "image_url", image_url: { url: p.image_url?.url ?? "" } };
+        return { type: "text", text: "" };
+      });
+  return {
+    role: m.role as ChatMessage["role"],
+    content,
+    ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+    ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+  } as ChatMessage;
 }
 
-function serializeResponseMeta(meta: ResponseMeta): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (meta.outputId !== undefined) out["output_id"] = meta.outputId;
-  if (meta.requestId !== undefined) out["request_id"] = meta.requestId;
-  if (meta.model !== undefined) out["model"] = meta.model;
-  if (meta.rawFields) out["_raw"] = meta.rawFields;
-  return out;
-}
+// ---- Auth ----
 
 async function authorizeRequest(req: IncomingMessage): Promise<{ status: number; body: string; contentType: string } | null> {
   const authHeader = (req.headers.authorization ?? "") as string;
   if (!authHeader.startsWith("Bearer ")) {
-    return {
-      status: 401,
-      body: JSON.stringify({ error: { message: "Unauthorized: missing or malformed Authorization header.", type: "freebuff_error" } }),
-      contentType: "application/json",
-    };
+    return { status: 401, body: JSON.stringify({ error: { message: "Unauthorized.", type: "freebuff_error" } }), contentType: "application/json" };
   }
   const presented = authHeader.slice("Bearer ".length);
   const presentedBuf = Buffer.from(presented, "utf8");
 
-  // Accept per-process secret
   const secretBuf = Buffer.from(PROXY_SECRET, "utf8");
   if (presentedBuf.length === secretBuf.length && crypto.timingSafeEqual(presentedBuf, secretBuf)) return null;
 
-  // Accept in-memory credentials
   if (proxyCredentials?.apiKey) {
     const credBuf = Buffer.from(proxyCredentials.apiKey, "utf8");
     if (presentedBuf.length === credBuf.length && crypto.timingSafeEqual(presentedBuf, credBuf)) return null;
   }
 
-  // Accept persisted apiKey from disk
   try {
     const creds = loadCredentials();
     if (creds?.apiKey && creds.apiKey !== proxyCredentials?.apiKey) {
@@ -102,11 +80,7 @@ async function authorizeRequest(req: IncomingMessage): Promise<{ status: number;
     }
   } catch {}
 
-  return {
-    status: 401,
-    body: JSON.stringify({ error: { message: "Unauthorized: Invalid Bearer token.", type: "freebuff_error" } }),
-    contentType: "application/json",
-  };
+  return { status: 401, body: JSON.stringify({ error: { message: "Unauthorized: Invalid Bearer token.", type: "freebuff_error" } }), contentType: "application/json" };
 }
 
 function getBody(req: IncomingMessage): Promise<string> {
@@ -118,18 +92,18 @@ function getBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+// ---- Handler ----
+
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
     const url = new URL(req.url ?? "/", `http://${FREEBUFF_PROXY_HOST}`);
 
-    // /health — unauthenticated
     if (url.pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
       return;
     }
 
-    // Auth gate for everything else
     const authErr = await authorizeRequest(req);
     if (authErr) {
       res.writeHead(authErr.status, { "Content-Type": authErr.contentType });
@@ -139,7 +113,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
     // /v1/models
     if (url.pathname === "/v1/models" || url.pathname === "/models") {
-      // Try to load catalog for full model list
       let allModels: ModelCatalogEntry[] = [];
       try {
         const creds = loadCredentials() ?? proxyCredentials;
@@ -149,12 +122,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         }
       } catch {}
       if (allModels.length === 0) allModels = getAllModels();
-      const data = allModels.map((m) => ({
-        id: m.modelUid,
-        object: "model" as const,
-        created: Math.floor(Date.now() / 1000),
-        owned_by: "freebuff",
-      }));
+      const data = allModels.map((m) => ({ id: m.modelUid, object: "model" as const, created: Math.floor(Date.now() / 1000), owned_by: "freebuff" }));
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ object: "list", data }));
       return;
@@ -170,9 +138,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
       const rawBody = await getBody(req);
       let requestBody: ChatCompletionRequest;
-      try {
-        requestBody = JSON.parse(rawBody);
-      } catch {
+      try { requestBody = JSON.parse(rawBody); } catch {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: "Malformed JSON." } }));
         return;
@@ -195,19 +161,19 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       const requestedModel = requestBody.model || getDefaultModel();
       const resolved = await resolveModel(requestedModel, creds.apiKey, creds.backendUrl);
 
-      const tools: ToolDef[] = (requestBody.tools ?? []).map((t) => ({
-        name: t.function?.name ?? "unknown",
-        description: t.function?.description ?? "",
-        parameters: t.function?.parameters ?? {},
+      const tools: ToolDefinition[] = (requestBody.tools ?? []).map((t) => ({
+        type: "function" as const,
+        function: {
+          name: t.function?.name ?? "unknown",
+          description: t.function?.description ?? "",
+          parameters: t.function?.parameters ?? {},
+        },
       }));
 
-      const multimodalMessages: ChatHistoryItem[] = requestBody.messages.map((m) => mapMessageToHistoryItem(m));
-      const requestedMaxTokens = typeof requestBody.max_tokens === "number" && requestBody.max_tokens > 0
-        ? requestBody.max_tokens
-        : 128_000;
+      const messages: ChatMessage[] = requestBody.messages.map(mapMessage);
+      const requestedMaxTokens = typeof requestBody.max_tokens === "number" && requestBody.max_tokens > 0 ? requestBody.max_tokens : 128_000;
       const isStreaming = requestBody.stream !== false;
 
-      // Ensure catalog is loaded for model resolution
       if (proxyCredentials) {
         try {
           const catalog = await getCachedCatalog(creds.apiKey, creds.backendUrl);
@@ -216,12 +182,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       }
 
       if (isStreaming) {
-        // SSE streaming response
-        res.writeHead(200, {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-        });
+        res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
 
         const responseId = `chatcmpl-${crypto.randomUUID()}`;
         const abort = new AbortController();
@@ -232,165 +193,105 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
           let toolCallIndex = -1;
           const toolIdToIndex = new Map<string, number>();
           let lastToolCallId: string | undefined;
-          let finishReason: "stop" | "tool_calls" | "length" | "content_filter" | null = null;
-          let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
-          let responseMeta: ResponseMeta | null = null;
+          let finishReason: string | null = null;
 
-          for await (const ev of streamChatEvents({
+          const chunk = (delta: Record<string, unknown>) => ({
+            id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requestedModel,
+            choices: [{ index: 0, delta, finish_reason: null }],
+          });
+
+          await streamCloudChat({
             apiKey: creds.apiKey,
             backendUrl: creds.backendUrl,
             modelUid: resolved.modelUid,
-            messages: multimodalMessages,
+            messages,
             tools: tools.length > 0 ? tools : undefined,
             completionOpts: { maxOutputTokens: requestedMaxTokens, temperature: requestBody.temperature },
             signal: abort.signal,
-          })) {
-            const role = firstChunkSent ? undefined : "assistant";
-
-            if (ev.kind === "text") {
-              const chunk = {
-                id: responseId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: requestedModel,
-                choices: [{ index: 0, delta: role ? { role, content: ev.text } : { content: ev.text }, finish_reason: null }],
-              };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-              firstChunkSent = true;
-            } else if (ev.kind === "reasoning") {
-              const chunk = {
-                id: responseId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: requestedModel,
-                choices: [{ index: 0, delta: role ? { role, reasoning: ev.text } : { reasoning: ev.text }, finish_reason: null }],
-              };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-              firstChunkSent = true;
-            } else if (ev.kind === "tool_call_start") {
-              toolCallIndex += 1;
-              toolIdToIndex.set(ev.id, toolCallIndex);
-              lastToolCallId = ev.id;
-              const baseDelta = { tool_calls: [{ index: toolCallIndex, id: ev.id, type: "function", function: { name: ev.name, arguments: "" } }] };
-              const delta = firstChunkSent ? baseDelta : { role: "assistant", ...baseDelta };
-              const chunk = {
-                id: responseId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: requestedModel,
-                choices: [{ index: 0, delta, finish_reason: null }],
-              };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-              firstChunkSent = true;
-            } else if (ev.kind === "tool_call_args") {
-              if (lastToolCallId === undefined || toolCallIndex < 0) continue;
-              const routeKey = ev.id ?? lastToolCallId;
-              const idx = toolIdToIndex.get(routeKey) ?? toolCallIndex;
-              const chunk = {
-                id: responseId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model: requestedModel,
-                choices: [{ index: 0, delta: { tool_calls: [{ index: idx, function: { arguments: ev.argsDelta } }] }, finish_reason: null }],
-              };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            } else if (ev.kind === "finish") {
-              finishReason = ev.reason;
-            } else if (ev.kind === "usage") {
-              usage = { promptTokens: ev.promptTokens, completionTokens: ev.completionTokens, totalTokens: ev.totalTokens };
-            } else if (ev.kind === "meta") {
-              responseMeta = ev.fields;
-            }
-          }
-
-          const finalReason = finishReason ?? (toolCallIndex >= 0 ? "tool_calls" : "stop");
-          const finishChunk = {
-            id: responseId,
-            object: "chat.completion.chunk",
-            created: Math.floor(Date.now() / 1000),
-            model: requestedModel,
-            choices: [{ index: 0, delta: {}, finish_reason: finalReason }],
-          };
-          res.write(`data: ${JSON.stringify(finishChunk)}\n\n`);
-
-          if (usage) {
-            const usageChunk: Record<string, unknown> = {
-              id: responseId,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: requestedModel,
-              choices: [],
-              usage: {
-                prompt_tokens: usage.promptTokens ?? 0,
-                completion_tokens: usage.completionTokens ?? 0,
-                total_tokens: usage.totalTokens ?? 0,
+            callbacks: {
+              onText: (text) => {
+                const delta = firstChunkSent ? { content: text } : { role: "assistant", content: text };
+                res.write(`data: ${JSON.stringify(chunk(delta))}\n\n`);
+                firstChunkSent = true;
               },
-            };
-            if (responseMeta) usageChunk["_freebuff_meta"] = serializeResponseMeta(responseMeta);
-            res.write(`data: ${JSON.stringify(usageChunk)}\n\n`);
-          }
-          res.write("data: [DONE]\n\n");
-          res.end();
+              onThinking: (text) => {
+                const delta = firstChunkSent ? { reasoning: text } : { role: "assistant", reasoning: text };
+                res.write(`data: ${JSON.stringify(chunk(delta))}\n\n`);
+                firstChunkSent = true;
+              },
+              onToolCall: (name, args) => {
+                toolCallIndex++;
+                const id = `call_${crypto.randomUUID().slice(0, 12)}`;
+                toolIdToIndex.set(id, toolCallIndex);
+                lastToolCallId = id;
+                const delta = firstChunkSent
+                  ? { tool_calls: [{ index: toolCallIndex, id, type: "function", function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) } }] }
+                  : { role: "assistant", tool_calls: [{ index: toolCallIndex, id, type: "function", function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) } }] };
+                res.write(`data: ${JSON.stringify(chunk(delta))}\n\n`);
+                firstChunkSent = true;
+              },
+              onFinish: (reason) => {
+                finishReason = reason;
+                const finalReason = finishReason ?? (toolCallIndex >= 0 ? "tool_calls" : "stop");
+                res.write(`data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: finalReason }] })}\n\n`);
+                res.write("data: [DONE]\n\n");
+                res.end();
+              },
+              onError: (err) => {
+                const msg = err instanceof Error ? err.message : "Unknown error";
+                try {
+                  res.write(`data: ${JSON.stringify({ error: { message: msg } })}\n\n`);
+                  res.write(`data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: "stop" as const }] })}\n\n`);
+                  res.write("data: [DONE]\n\n");
+                  res.end();
+                } catch {}
+              },
+            },
+          });
         } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : "Unknown error";
           try {
-            res.write(`data: ${JSON.stringify({ error: { message: errorMessage } })}\n\n`);
-            const fChunk = {
-              id: responseId,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model: requestedModel,
-              choices: [{ index: 0, delta: {}, finish_reason: "stop" as const }],
-            };
-            res.write(`data: ${JSON.stringify(fChunk)}\n\n`);
+            const msg = error instanceof Error ? error.message : "Unknown error";
+            res.write(`data: ${JSON.stringify({ error: { message: msg } })}\n\n`);
             res.write("data: [DONE]\n\n");
             res.end();
-          } catch { /* socket dead */ }
+          } catch {}
         }
       } else {
-        // Non-streaming response
+        // Non-streaming
         let collected = "";
-        let finishReason: "stop" | "tool_calls" | "length" | "content_filter" = "stop";
-        let usage: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null = null;
-        let responseMeta: ResponseMeta | null = null;
-        type CollectedToolCall = { id: string; name: string; args: string };
-        const collectedToolCalls: CollectedToolCall[] = [];
-        let currentToolCall: CollectedToolCall | null = null;
+        let finishReason = "stop";
+        const toolCalls: Array<{ id: string; name: string; args: string }> = [];
 
         const abort = new AbortController();
-        for await (const ev of streamChatEvents({
+        await streamCloudChat({
           apiKey: creds.apiKey,
           backendUrl: creds.backendUrl,
           modelUid: resolved.modelUid,
-          messages: multimodalMessages,
+          messages,
           tools: tools.length > 0 ? tools : undefined,
           completionOpts: { maxOutputTokens: requestedMaxTokens, temperature: requestBody.temperature },
           signal: abort.signal,
-        })) {
-          if (ev.kind === "text") collected += ev.text;
-          else if (ev.kind === "tool_call_start") { currentToolCall = { id: ev.id, name: ev.name, args: "" }; collectedToolCalls.push(currentToolCall); }
-          else if (ev.kind === "tool_call_args") { if (currentToolCall) currentToolCall.args += ev.argsDelta; }
-          else if (ev.kind === "finish") finishReason = ev.reason;
-          else if (ev.kind === "usage") usage = { promptTokens: ev.promptTokens, completionTokens: ev.completionTokens, totalTokens: ev.totalTokens };
-          else if (ev.kind === "meta") responseMeta = ev.fields;
-        }
-        if (collectedToolCalls.length > 0 && finishReason === "stop") finishReason = "tool_calls";
+          callbacks: {
+            onText: (text) => { collected += text; },
+            onToolCall: (name, args) => {
+              toolCalls.push({ id: `call_${crypto.randomUUID().slice(0, 12)}`, name, args: typeof args === "string" ? args : JSON.stringify(args) });
+            },
+            onFinish: (reason) => { finishReason = reason; },
+            onError: (err) => { throw err; },
+          },
+        });
 
-        const assistantMessage = collectedToolCalls.length > 0
-          ? { role: "assistant" as const, content: collected, tool_calls: collectedToolCalls.map((tc) => ({ id: tc.id, type: "function" as const, function: { name: tc.name, arguments: tc.args } })) }
+        if (toolCalls.length > 0 && finishReason === "stop") finishReason = "tool_calls";
+
+        const assistantMessage = toolCalls.length > 0
+          ? { role: "assistant" as const, content: collected, tool_calls: toolCalls.map((tc) => ({ id: tc.id, type: "function" as const, function: { name: tc.name, arguments: tc.args } })) }
           : { role: "assistant" as const, content: collected };
 
-        const resp: Record<string, unknown> = {
-          id: `chatcmpl-${crypto.randomUUID()}`,
-          object: "chat.completion",
-          created: Math.floor(Date.now() / 1000),
-          model: requestedModel,
-          choices: [{ index: 0, message: assistantMessage, finish_reason: finishReason }],
-          ...(usage ? { usage: { prompt_tokens: usage.promptTokens ?? 0, completion_tokens: usage.completionTokens ?? 0, total_tokens: usage.totalTokens ?? 0 } } : {}),
-        };
-        if (responseMeta) resp["_freebuff_meta"] = serializeResponseMeta(responseMeta);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(resp));
+        res.end(JSON.stringify({
+          id: `chatcmpl-${crypto.randomUUID()}`, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: requestedModel,
+          choices: [{ index: 0, message: assistantMessage, finish_reason: finishReason }],
+        }));
       }
       return;
     }
@@ -399,47 +300,29 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     res.end(JSON.stringify({ error: { message: `Unsupported path: ${url.pathname}` } }));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    try {
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: { message } }));
-    } catch {}
+    try { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message } })); } catch {}
   }
 }
 
-// ----------------------------------------------------------------------------
-// Server startup
-// ----------------------------------------------------------------------------
+// ---- Server ----
 
 let serverInstance: ReturnType<typeof createServer> | null = null;
 
 export function startProxy(port: number = FREEBUFF_PROXY_PORT): Promise<number> {
   if (serverInstance) return Promise.resolve((serverInstance.address() as { port: number }).port);
-
   return new Promise((resolve, reject) => {
     const srv = createServer(handleRequest);
     srv.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
-        // Try fallback port
-        srv.listen(0, FREEBUFF_PROXY_HOST, () => {
-          const addr = srv.address() as { port: number };
-          serverInstance = srv;
-          resolve(addr.port);
-        });
+        srv.listen(0, FREEBUFF_PROXY_HOST, () => { serverInstance = srv; resolve((srv.address() as { port: number }).port); });
         return;
       }
       reject(err);
     });
-    srv.listen(port, FREEBUFF_PROXY_HOST, () => {
-      serverInstance = srv;
-      const addr = srv.address() as { port: number };
-      resolve(addr.port);
-    });
+    srv.listen(port, FREEBUFF_PROXY_HOST, () => { serverInstance = srv; resolve((srv.address() as { port: number }).port); });
   });
 }
 
 export function stopProxy(): void {
-  if (serverInstance) {
-    try { serverInstance.close(); } catch {}
-    serverInstance = null;
-  }
+  if (serverInstance) { try { serverInstance.close(); } catch {} serverInstance = null; }
 }

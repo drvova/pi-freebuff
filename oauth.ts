@@ -124,8 +124,6 @@ export async function runLoginLoopback(
   signal?: AbortSignal,
 ): Promise<string> {
   const fingerprintId = getFingerprintId();
-  const fingerprintString = getFingerprintString();
-  const fingerprintHash = getFingerprintHash(fingerprintString);
 
   // Step 1: Request device code
   console.error("[freebuff] requesting device code...");
