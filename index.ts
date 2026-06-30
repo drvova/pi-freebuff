@@ -9,7 +9,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { startProxy, stopProxy, PROXY_SECRET, setProxyCredentials } from "./proxy";
-import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runDeviceCodeLogin, registerUser, type PersistedCredentials } from "./oauth";
+import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runLoginLoopback, exchangeSessionForApiKey, type PersistedCredentials } from "./oauth";
 import { clearCachedToken } from "./auth";
 import { clearSessionIds } from "./chat";
 import { getAllModels, getCachedCatalog, clearCachedCatalog, type ModelCatalogEntry } from "./catalog";
@@ -60,11 +60,9 @@ async function buildDynamicModels(apiKey: string, backendUrl: string): Promise<R
 
 // OAuth
 async function loginFreebuff(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  const token = await runDeviceCodeLogin(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
-  if (!token) throw new Error("No token received.");
-
-  const result = await registerUser(token, DEFAULT_REGION);
-  saveCredentials({ ...result, issuedAt: new Date().toISOString(), oauthClientId: DEFAULT_REGION.oauthClientId });
+  const sessionToken = await runLoginLoopback(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
+  const result = await exchangeSessionForApiKey(sessionToken, DEFAULT_REGION);
+  saveCredentials({ ...result, issuedAt: new Date().toISOString() });
   setProxyCredentials({ apiKey: result.apiKey, backendUrl: result.backendUrl });
   clearCachedToken();
   clearSessionIds();
