@@ -1,7 +1,12 @@
 /**
  * Cloud-direct chat via REST API.
- * Uses Codebuff's /api/v1/chat/completions endpoint with Bearer token auth.
- * Streams responses back as SSE events.
+ * Uses Codebuff's session + run + chat completions flow.
+ *
+ * Flow per request:
+ *   1. POST /api/v1/freebuff/session — create session
+ *   2. POST /api/v1/agent-runs {action:'START', agentId} — get runId
+ *   3. POST /api/v1/chat/completions — send with runId
+ *   4. POST /api/v1/agent-runs {action:'FINISH', runId} — finish
  */
 
 import * as crypto from "crypto";
@@ -47,6 +52,24 @@ export class CloudChatError extends Error {
   }
 }
 
+// ---- Model → Agent mapping (from freebuff free-agents.ts) ----
+
+const MODEL_TO_AGENT: Record<string, string> = {
+  "minimax/minimax-m2.7": "base2-free",
+  "minimax/minimax-m3": "base2-free-minimax-m3",
+  "moonshotai/kimi-k2.6": "base2-free-kimi",
+  "deepseek/deepseek-v4-pro": "base2-free-deepseek",
+  "deepseek/deepseek-v4-flash": "base2-free-deepseek-flash",
+  "mimo/mimo-v2.5": "base2-free-mimo",
+  "mimo/mimo-v2.5-pro": "base2-free-mimo-pro",
+  "z-ai/glm-5.2": "base2-free-glm",
+  "google/gemini-3.1-pro-preview": "base2-free",
+};
+
+function agentForModel(model: string): string {
+  return MODEL_TO_AGENT[model] ?? "base2-free";
+}
+
 // ---- Content helpers ----
 
 function contentToText(content: ChatMessage["content"]): string {
@@ -58,9 +81,73 @@ function contentToText(content: ChatMessage["content"]): string {
   }).join("");
 }
 
+// ---- HTTP helpers ----
+
+const API_BASE = DEFAULT_REGION.api;
+const UA = "Bun/1.3.11";
+
+async function apiPost(path: string, authToken: string, body?: Record<string, unknown>, extraHeaders?: Record<string, string>): Promise<{ status: number; data: unknown }> {
+  const headers: Record<string, string> = {
+    "authorization": `Bearer ${authToken}`,
+    "user-agent": UA,
+    "accept": "application/json",
+    ...extraHeaders,
+  };
+  if (body) headers["content-type"] = "application/json";
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data: unknown;
+  try { data = JSON.parse(text); } catch { data = text; }
+  return { status: res.status, data };
+}
+
+// ---- Session + Run lifecycle ----
+
+async function createSession(authToken: string, model: string): Promise<void> {
+  const { status } = await apiPost("/api/v1/freebuff/session", authToken, undefined, { "x-freebuff-model": model });
+  if (status < 200 || status >= 300) {
+    throw new CloudChatError(`create session failed: HTTP ${status}`, "session_error", status);
+  }
+}
+
+async function startRun(authToken: string, agentId: string): Promise<string> {
+  const { status, data } = await apiPost("/api/v1/agent-runs", authToken, { action: "START", agentId });
+  if (status < 200 || status >= 300) {
+    throw new CloudChatError(`start run failed: HTTP ${status}`, "run_error", status);
+  }
+  const runId = (data as { runId?: string })?.runId ?? "";
+  if (!runId) throw new CloudChatError(`start run missing runId: ${JSON.stringify(data)}`, "run_error");
+  return runId;
+}
+
+async function finishRun(authToken: string, runId: string): Promise<void> {
+  const { status } = await apiPost("/api/v1/agent-runs", authToken, {
+    action: "FINISH", runId, status: "completed",
+    totalSteps: 1, directCredits: 0, totalCredits: 0,
+  });
+  if (status < 200 || status >= 300) {
+    // Non-fatal: run finish is best-effort
+    console.error(`[freebuff] finish run failed: HTTP ${status}`);
+  }
+}
+
 // ---- Main streaming function ----
 
 export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
+  const agentId = agentForModel(req.modelUid);
+
+  // 1. Create session
+  await createSession(req.apiKey, req.modelUid);
+
+  // 2. Start run → get runId
+  const runId = await startRun(req.apiKey, agentId);
+
+  // 3. Build chat completion body
   const body: Record<string, unknown> = {
     model: req.modelUid,
     messages: req.messages.map((m) => ({
@@ -71,7 +158,7 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
     })),
     stream: true,
     codebuff_metadata: {
-      run_id: crypto.randomUUID(),
+      run_id: runId,
       cost_mode: "free",
       client_id: crypto.randomUUID(),
     },
@@ -80,13 +167,14 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   if (req.completionOpts?.maxOutputTokens) body.max_tokens = req.completionOpts.maxOutputTokens;
   if (req.completionOpts?.temperature !== undefined) body.temperature = req.completionOpts.temperature;
 
-  const response = await fetch(`${DEFAULT_REGION.api}/api/v1/chat/completions`, {
+  // 4. Send chat completion
+  const response = await fetch(`${API_BASE}/api/v1/chat/completions`, {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${req.apiKey}`,
       "Content-Type": "application/json",
       "Accept": "*/*",
-      "User-Agent": "Bun/1.3.11",
+      "User-Agent": UA,
     },
     body: JSON.stringify(body),
     signal: req.signal,
@@ -94,16 +182,21 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
+    await finishRun(req.apiKey, runId).catch(() => {});
     throw new CloudChatError(`HTTP ${response.status}: ${text.slice(0, 300)}`, "http_error", response.status);
   }
 
-  if (!response.body) throw new CloudChatError("No response body", "no_body");
+  if (!response.body) {
+    await finishRun(req.apiKey, runId).catch(() => {});
+    throw new CloudChatError("No response body", "no_body");
+  }
 
   req.callbacks.onStart?.();
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
   let finished = false;
+  let stepCount = 0;
   const toolCallAccum: Map<number, { id: string; name: string; args: string }> = new Map();
 
   const finish = (reason: string) => {
@@ -130,14 +223,14 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
         const trimmed = line.trim();
         if (!trimmed.startsWith("data: ")) continue;
         const data = trimmed.slice(6);
-        if (data === "[DONE]") { finish("stop"); return; }
+        if (data === "[DONE]") { finish("stop"); break; }
 
         try {
           const parsed = JSON.parse(data);
           const choice = parsed.choices?.[0];
           if (!choice) continue;
           const delta = choice.delta;
-          if (delta?.content) req.callbacks.onText?.(delta.content);
+          if (delta?.content) { req.callbacks.onText?.(delta.content); stepCount++; }
 
           if (delta?.tool_calls) {
             for (const tc of delta.tool_calls) {
@@ -152,10 +245,14 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
           if (choice.finish_reason) finish(choice.finish_reason);
         } catch {}
       }
+      if (finished) break;
     }
     if (!finished) finish("stop");
   } catch (err) {
     if (!finished) { req.callbacks.onError?.(err); throw err; }
+  } finally {
+    // 5. Finish run (best-effort)
+    await finishRun(req.apiKey, runId).catch(() => {});
   }
 }
 
