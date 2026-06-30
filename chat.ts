@@ -3,10 +3,12 @@
  * Uses Codebuff's session + run + chat completions flow.
  *
  * Flow per request:
- *   1. POST /api/v1/freebuff/session — create session
+ *   1. Reuse cached session (or POST /api/v1/freebuff/session to create)
  *   2. POST /api/v1/agent-runs {action:'START', agentId} — get runId
  *   3. POST /api/v1/chat/completions — send with runId
  *   4. POST /api/v1/agent-runs {action:'FINISH', runId} — finish
+ *
+ * Sessions are cached and reused to avoid 429 rate limits.
  */
 
 import * as crypto from "crypto";
@@ -106,14 +108,60 @@ async function apiPost(path: string, authToken: string, body?: Record<string, un
   return { status: res.status, data };
 }
 
-// ---- Session + Run lifecycle ----
+async function apiDelete(path: string, authToken: string): Promise<{ status: number }> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "DELETE",
+    headers: {
+      "authorization": `Bearer ${authToken}`,
+      "user-agent": UA,
+      "accept": "application/json",
+    },
+  });
+  return { status: res.status };
+}
 
-async function createSession(authToken: string, model: string): Promise<void> {
+// ---- Session cache (reuse sessions to avoid 429) ----
+
+interface CachedSession {
+  model: string;
+  createdAt: number;
+}
+
+const sessionCache = new Map<string, CachedSession>();
+const SESSION_TTL_MS = 30 * 60_000; // 30 min
+
+async function ensureSession(authToken: string, model: string): Promise<void> {
+  const cached = sessionCache.get(authToken);
+  if (cached && cached.model === model && Date.now() - cached.createdAt < SESSION_TTL_MS) {
+    return; // Reuse existing session
+  }
+
+  // End old session if switching models
+  if (cached && cached.model !== model) {
+    await apiDelete("/api/v1/freebuff/session", authToken).catch(() => {});
+    sessionCache.delete(authToken);
+  }
+
+  // Create new session
   const { status } = await apiPost("/api/v1/freebuff/session", authToken, undefined, { "x-freebuff-model": model });
   if (status < 200 || status >= 300) {
-    throw new CloudChatError(`create session failed: HTTP ${status}`, "session_error", status);
+    // 429 = rate limited, wait and retry once
+    if (status === 429) {
+      console.error("[freebuff] session 429, waiting 5s...");
+      await new Promise(r => setTimeout(r, 5000));
+      const retry = await apiPost("/api/v1/freebuff/session", authToken, undefined, { "x-freebuff-model": model });
+      if (retry.status < 200 || retry.status >= 300) {
+        throw new CloudChatError(`create session failed: HTTP ${retry.status}`, "session_error", retry.status);
+      }
+    } else {
+      throw new CloudChatError(`create session failed: HTTP ${status}`, "session_error", status);
+    }
   }
+
+  sessionCache.set(authToken, { model, createdAt: Date.now() });
 }
+
+// ---- Run lifecycle ----
 
 async function startRun(authToken: string, agentId: string): Promise<string> {
   const { status, data } = await apiPost("/api/v1/agent-runs", authToken, { action: "START", agentId });
@@ -131,7 +179,6 @@ async function finishRun(authToken: string, runId: string): Promise<void> {
     totalSteps: 1, directCredits: 0, totalCredits: 0,
   });
   if (status < 200 || status >= 300) {
-    // Non-fatal: run finish is best-effort
     console.error(`[freebuff] finish run failed: HTTP ${status}`);
   }
 }
@@ -141,8 +188,8 @@ async function finishRun(authToken: string, runId: string): Promise<void> {
 export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   const agentId = agentForModel(req.modelUid);
 
-  // 1. Create session
-  await createSession(req.apiKey, req.modelUid);
+  // 1. Ensure session (cached or create new)
+  await ensureSession(req.apiKey, req.modelUid);
 
   // 2. Start run → get runId
   const runId = await startRun(req.apiKey, agentId);
@@ -196,7 +243,6 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = "";
   let finished = false;
-  let stepCount = 0;
   const toolCallAccum: Map<number, { id: string; name: string; args: string }> = new Map();
 
   const finish = (reason: string) => {
@@ -230,7 +276,7 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
           const choice = parsed.choices?.[0];
           if (!choice) continue;
           const delta = choice.delta;
-          if (delta?.content) { req.callbacks.onText?.(delta.content); stepCount++; }
+          if (delta?.content) req.callbacks.onText?.(delta.content);
 
           if (delta?.tool_calls) {
             for (const tc of delta.tool_calls) {
