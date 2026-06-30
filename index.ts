@@ -9,7 +9,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { startProxy, stopProxy, PROXY_SECRET, setProxyCredentials } from "./proxy";
-import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runLoginLoopback, registerUser, type PersistedCredentials } from "./oauth";
+import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runDeviceCodeLogin, runManualTokenLogin, registerUser, type PersistedCredentials } from "./oauth";
 import { clearCachedToken } from "./auth";
 import { clearSessionIds } from "./chat";
 import { getAllModels, getCachedCatalog, clearCachedCatalog, type ModelCatalogEntry } from "./catalog";
@@ -62,18 +62,10 @@ async function buildDynamicModels(apiKey: string, backendUrl: string): Promise<R
 async function loginFreebuff(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
   let token: string;
   try {
-    token = await runLoginLoopback(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
+    token = await runDeviceCodeLogin(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
   } catch {
-    const pasted = await callbacks.onPrompt({
-      message: `Open this URL, sign in, paste callback URL or token:\n\n  ${DEFAULT_REGION.website}\n\nPaste:`,
-    });
-    const trimmed = pasted.trim();
-    try {
-      const u = new URL(trimmed);
-      token = u.searchParams.get("token") ?? u.searchParams.get("authToken") ?? trimmed;
-    } catch {
-      token = trimmed;
-    }
+    // Fallback: manual token paste
+    token = await runManualTokenLogin(DEFAULT_REGION, (msg) => callbacks.onPrompt(msg));
   }
   if (!token) throw new Error("No token received.");
 

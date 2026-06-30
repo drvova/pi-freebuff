@@ -1,12 +1,17 @@
 /**
  * OAuth login + credential storage for Freebuff/Codebuff.
+ *
+ * Codebuff uses a DEVICE CODE flow:
+ *   1. POST /api/auth/cli/code → device_code + verification_url
+ *   2. User opens verification_url and signs in
+ *   3. Poll GET /api/auth/cli/status?device_code=... → authToken
  */
 
 import * as http from "http";
-import * as crypto from "crypto";
-import * as fs from "fs";
-import * as path from "path";
-import * as os from "os";
+import * as crypto = require("crypto");
+import * as fs = require("fs");
+import * as path = require("path");
+import * as os = require("os");
 import { spawn } from "child_process";
 
 // ----------------------------------------------------------------------------
@@ -86,8 +91,16 @@ export function deleteCredentials(): boolean {
 }
 
 // ----------------------------------------------------------------------------
-// RegisterUser (Codebuff CLI login)
+// Device Code Flow (Codebuff CLI auth)
 // ----------------------------------------------------------------------------
+
+interface DeviceCodeResponse {
+  device_code: string;
+  user_code: string;
+  verification_url: string;
+  expires_in: number;
+  interval: number;
+}
 
 export class FreebuffRegistrationError extends Error {
   readonly status: number;
@@ -97,6 +110,136 @@ export class FreebuffRegistrationError extends Error {
     this.status = status;
   }
 }
+
+async function requestDeviceCode(region: FreebuffRegion): Promise<DeviceCodeResponse> {
+  const response = await fetch(`${region.website}/api/auth/cli/code`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new FreebuffRegistrationError(
+      `Device code request failed: HTTP ${response.status}: ${text.slice(0, 300)}`,
+      response.status,
+    );
+  }
+  return JSON.parse(text) as DeviceCodeResponse;
+}
+
+async function pollDeviceStatus(
+  region: FreebuffRegion,
+  deviceCode: string,
+  intervalMs: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const deadline = Date.now() + 10 * 60 * 1000; // 10 min max
+  const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw new Error("Sign-in cancelled.");
+
+    const url = `${region.website}/api/auth/cli/status?device_code=${encodeURIComponent(deviceCode)}`;
+    const response = await fetch(url, {
+      method: "GET",
+      signal: AbortSignal.timeout(10_000),
+    });
+    const text = await response.text();
+
+    if (response.ok) {
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const token = parsed.token ?? parsed.authToken ?? parsed.session_token ?? parsed.access_token;
+      if (typeof token === "string" && token) return token;
+
+      // Some APIs return the token nested
+      const user = parsed.user as Record<string, unknown> | undefined;
+      if (user) {
+        const nestedToken = user.token ?? user.authToken ?? user.session_token;
+        if (typeof nestedToken === "string" && nestedToken) return nestedToken;
+      }
+
+      // Check status field
+      const status = parsed.status as string | undefined;
+      if (status === "approved" || status === "complete" || status === "success") {
+        // Token might be in a different field
+        for (const key of Object.keys(parsed)) {
+          const val = parsed[key];
+          if (typeof val === "string" && val.length > 20 && val.includes(".")) {
+            return val; // Likely a JWT
+          }
+        }
+      }
+    }
+
+    if (response.status === 404) {
+      // Device code not found yet or expired — keep polling
+    }
+
+    await delay(intervalMs * 1000);
+  }
+
+  throw new Error("Device code expired. Please try again.");
+}
+
+/**
+ * Device code login flow.
+ * 1. Request device code from codebuff
+ * 2. Show verification URL to user
+ * 3. Poll until user completes sign-in
+ * 4. Return the auth token
+ */
+export async function runDeviceCodeLogin(
+  region: FreebuffRegion,
+  onUrl: (url: string) => void,
+  signal?: AbortSignal,
+): Promise<string> {
+  const deviceCodeResp = await requestDeviceCode(region);
+  const verificationUrl = deviceCodeResp.verification_url
+    || `${region.website}/auth/cli?user_code=${deviceCodeResp.user_code}`;
+
+  onUrl(verificationUrl);
+  await openBrowser(verificationUrl).catch(() => {});
+
+  const token = await pollDeviceStatus(
+    region,
+    deviceCodeResp.device_code,
+    deviceCodeResp.interval || 5,
+    signal,
+  );
+
+  if (!token) throw new Error("No token received from device code flow.");
+  return token;
+}
+
+/**
+ * Fallback: manual token paste.
+ * Shows the website URL and asks user to paste their session token.
+ */
+export async function runManualTokenLogin(
+  region: FreebuffRegion,
+  onPrompt: (opts: { message: string }) => Promise<string>,
+): Promise<string> {
+  const pasted = await onPrompt({
+    message: `Open this URL, sign in, then paste your session token or the full callback URL:\n\n  ${region.website}\n\nToken:`,
+  });
+  const trimmed = pasted.trim();
+
+  // Try to extract token from URL
+  try {
+    const u = new URL(trimmed);
+    return u.searchParams.get("token")
+      ?? u.searchParams.get("authToken")
+      ?? u.searchParams.get("access_token")
+      ?? u.searchParams.get("session_token")
+      ?? trimmed;
+  } catch {
+    return trimmed;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// RegisterUser — exchange token for API key
+// ----------------------------------------------------------------------------
 
 export async function registerUser(
   authToken: string,
@@ -128,7 +271,7 @@ export async function registerUser(
   }
 
   const parsed = JSON.parse(text) as Record<string, unknown>;
-  const token = parsed.authToken ?? parsed.token ?? authToken;
+  const token = parsed.token ?? parsed.authToken ?? parsed.session_token ?? parsed.access_token ?? authToken;
 
   if (typeof token !== "string" || !token) {
     throw new FreebuffRegistrationError("Auth status returned 200 but no token found", response.status);
@@ -143,104 +286,8 @@ export async function registerUser(
 }
 
 // ----------------------------------------------------------------------------
-// Login flow — loopback callback
+// Browser opener
 // ----------------------------------------------------------------------------
-
-export async function runLoginLoopback(
-  region: FreebuffRegion,
-  onUrl: (url: string) => void,
-  signal?: AbortSignal,
-): Promise<string> {
-  const state = crypto.randomUUID();
-  const server = await startCallbackServer();
-  const callbackUrl = `http://127.0.0.1:${server.port}/auth`;
-  const loginUrl = `${region.website}/auth/signin?callbackUrl=${encodeURIComponent(callbackUrl)}`;
-
-  const callbackPromise = server.callback(state);
-  callbackPromise.catch(() => {});
-
-  onUrl(loginUrl);
-  await openBrowser(loginUrl).catch(() => {});
-
-  const callback = await waitWithTimeout(callbackPromise, 5 * 60 * 1000, signal, "Sign-in timed out.");
-
-  if (!callback.token) throw new Error("OAuth callback delivered an empty token.");
-  server.close();
-  return callback.token;
-}
-
-interface CallbackServer {
-  port: number;
-  close: () => void;
-  callback: (expectedState: string) => Promise<CallbackResult>;
-}
-
-interface CallbackResult {
-  token: string;
-  state: string;
-}
-
-function startCallbackServer(): Promise<CallbackServer> {
-  return new Promise((resolve, reject) => {
-    let captured: { token: string; state: string } | null = null;
-    const waiters: Array<{ state: string; resolve: (r: CallbackResult) => void; reject: (e: Error) => void }> = [];
-
-    const server = http.createServer((req, res) => {
-      const url = new URL(req.url ?? "/", "http://127.0.0.1");
-      if (url.pathname !== "/auth") {
-        res.writeHead(404);
-        res.end("Not Found");
-        return;
-      }
-
-      const tokenParam = url.searchParams.get("token") ?? url.searchParams.get("authToken");
-      const stateParam = url.searchParams.get("state") ?? "";
-
-      if (!tokenParam) {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("<html><body><p>No token in URL. Close this tab.</p></body></html>");
-        return;
-      }
-
-      const matchedWaiter = waiters.find((w) => w.state === stateParam);
-      if (!matchedWaiter) {
-        res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("<html><body><p>Unexpected callback.</p></body></html>");
-        return;
-      }
-
-      captured = { token: tokenParam, state: stateParam };
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-      res.end("<html><body><h1>Signed in</h1><p>You can close this tab.</p></body></html>");
-
-      for (let i = waiters.length - 1; i >= 0; i--) {
-        const w = waiters[i];
-        if (w.state === captured.state) {
-          w.resolve(captured);
-          waiters.splice(i, 1);
-        }
-      }
-    });
-
-    server.on("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      if (!addr || typeof addr === "string") {
-        reject(new Error("Failed to bind"));
-        return;
-      }
-      resolve({
-        port: addr.port,
-        close: () => server.close(),
-        callback: (expectedState: string) =>
-          new Promise((res, rej) => {
-            if (captured) res({ token: captured.token, state: captured.state });
-            else waiters.push({ state: expectedState, resolve: res, reject: rej });
-          }),
-      });
-    });
-  });
-}
 
 async function openBrowser(url: string): Promise<void> {
   const cmds = process.platform === "darwin"
@@ -258,17 +305,4 @@ async function openBrowser(url: string): Promise<void> {
     if (ok) return;
   }
   throw new Error(`Unable to open browser. Open this URL manually:\n  ${url}`);
-}
-
-function waitWithTimeout<T>(p: Promise<T>, timeoutMs: number, signal: AbortSignal | undefined, msg: string): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const onAbort = () => { cleanup(); reject(new Error("Sign-in cancelled.")); };
-    const timer = setTimeout(() => { cleanup(); reject(new Error(msg)); }, timeoutMs);
-    const cleanup = () => { clearTimeout(timer); if (signal) signal.removeEventListener("abort", onAbort); };
-    if (signal) {
-      if (signal.aborted) { onAbort(); return; }
-      signal.addEventListener("abort", onAbort, { once: true });
-    }
-    p.then((v) => { cleanup(); resolve(v); }, (e) => { cleanup(); reject(e); });
-  });
 }
