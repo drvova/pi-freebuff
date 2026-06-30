@@ -83,13 +83,21 @@ export default async function (pi: ExtensionAPI) {
     }
   } catch {}
 
+  // Build models list BEFORE registering provider so Pi sees them
+  let liveModels: ReturnType<typeof catalogModelToPi>[] = [];
+  if (hasCreds) {
+    try {
+      liveModels = await buildDynamicModels(apiKey);
+    } catch {}
+  }
+
   pi.registerProvider("freebuff", {
     name: "Freebuff (Codebuff)",
     baseUrl,
     apiKey: PROXY_SECRET,
     api: "openai-completions",
     authHeader: true,
-    models: [],
+    models: liveModels,
     oauth: {
       name: "Freebuff (Codebuff)",
       login: loginFreebuff,
@@ -98,13 +106,7 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  if (hasCreds) {
-    buildDynamicModels(apiKey).then((liveModels) => {
-      if (liveModels.length > 0) console.error(`[freebuff] catalog: ${liveModels.length} models (restart to use)`);
-    }).catch(() => {});
-  }
-
-  console.error(hasCreds ? `[freebuff] connected` : `[freebuff] /freebuff-login to connect`);
+  console.error(hasCreds ? `[freebuff] connected — ${liveModels.length} models` : `[freebuff] /freebuff-login to connect`);
 
   pi.registerCommand("freebuff-status", {
     description: "Show Freebuff auth status",
