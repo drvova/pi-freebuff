@@ -4,6 +4,7 @@
  * Streams responses back as SSE events.
  */
 
+import * as crypto from "crypto";
 import { DEFAULT_REGION } from "./oauth";
 
 // ---- Types ----
@@ -69,6 +70,11 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
       ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
     })),
     stream: true,
+    codebuff_metadata: {
+      run_id: crypto.randomUUID(),
+      cost_mode: "free",
+      client_id: crypto.randomUUID(),
+    },
   };
   if (req.tools && req.tools.length > 0) body.tools = req.tools;
   if (req.completionOpts?.maxOutputTokens) body.max_tokens = req.completionOpts.maxOutputTokens;
