@@ -2,218 +2,207 @@
  * Cloud-direct streaming chat via WebSocket.
  * Translates OpenAI chat requests → Freebuff/Codebuff JSON-RPC 2.0 wire format,
  * streams responses back as SSE events.
+ *
+ * Uses Node 22+ native WebSocket (no npm dependencies).
  */
+
 import * as crypto from "crypto";
-import WebSocket from "ws";
-import {
-  buildFreebuffMessage,
-  buildJsonRpcRequest,
-  buildFreebuffPing,
-  parseFreebuffMessage,
-  type FreebuffEnvelope,
-  type JsonRpcMessage,
-} from "./wire";
+import { buildFreebuffMessage, buildJsonRpcRequest, parseFreebuffMessage, type FreebuffEnvelope } from "./wire";
+
+// Use native WebSocket (Node 22+)
+const WS = globalThis.WebSocket;
 
 // ----------------------------------------------------------------------------
 // Types
 // ----------------------------------------------------------------------------
 
-const WS_CONNECT_TIMEOUT_MS = 30_000;
-const WS_IDLE_TIMEOUT_MS = 120_000;
-const WS_PING_INTERVAL_MS = 30_000;
-
-export type ContentPart =
-  | { type: "text"; text: string }
-  | { type: "image"; mimeType: string; base64Data: string; caption?: string };
-
-export interface ChatHistoryItem {
-  role: "user" | "assistant" | "system" | "tool";
-  content: string | ContentPart[];
+export interface ChatMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | Array<{ type: string; [key: string]: unknown }>;
   tool_call_id?: string;
-  tool_calls?: Array<{ id: string; name: string; arguments: string }>;
+  tool_calls?: unknown[];
 }
 
-export interface ToolDef {
-  name: string;
-  description: string;
-  parameters: unknown;
+export interface ToolDefinition {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: Record<string, unknown>;
+  };
 }
 
-export type CloudChatEvent =
-  | { kind: "text"; text: string }
-  | { kind: "reasoning"; text: string }
-  | { kind: "tool_call_start"; id: string; name: string }
-  | { kind: "tool_call_args"; argsDelta: string; id?: string }
-  | { kind: "finish"; reason: "stop" | "tool_calls" | "length" | "content_filter" }
-  | { kind: "usage"; promptTokens?: number; completionTokens?: number; totalTokens?: number }
-  | { kind: "meta"; fields: ResponseMeta };
+export type StreamEventType =
+  | "message_start"
+  | "content_block_start"
+  | "content_block_delta"
+  | "content_block_stop"
+  | "message_delta"
+  | "message_stop"
+  | "ping";
 
-export interface ResponseMeta {
-  outputId?: string;
-  requestId?: string;
-  model?: string;
-  rawFields: Record<string, unknown>;
+export interface StreamEvent {
+  type: StreamEventType;
+  index?: number;
+  delta?: { type?: string; text?: string; partial_json?: string; [key: string]: unknown };
+  message?: { id?: string; role?: string; model?: string; [key: string]: unknown };
+  usage?: { input_tokens: number; output_tokens: number; [key: string]: unknown };
+  [key: string]: unknown;
+}
+
+export interface CloudChatCallbacks {
+  onStart?: () => void;
+  onEvent?: (event: StreamEvent) => void;
+  onText?: (text: string) => void;
+  onToolCall?: (name: string, args: unknown) => void;
+  onToolResult?: (id: string, result: string) => void;
+  onThinking?: (text: string) => void;
+  onFinish?: (reason: string) => void;
+  onError?: (error: unknown) => void;
 }
 
 export interface CloudChatRequest {
   apiKey: string;
   backendUrl: string;
   modelUid: string;
-  messages: ChatHistoryItem[];
-  tools?: ToolDef[];
+  messages: ChatMessage[];
+  tools?: ToolDefinition[];
   completionOpts?: { maxOutputTokens?: number; temperature?: number };
   inferenceConfig?: Record<string, unknown>;
   signal?: AbortSignal;
+  callbacks: CloudChatCallbacks;
 }
 
 export class CloudChatError extends Error {
-  constructor(message: string, public readonly code?: string) {
+  constructor(
+    message: string,
+    public code: string,
+    public status?: number,
+  ) {
     super(message);
     this.name = "CloudChatError";
   }
 }
 
 // ----------------------------------------------------------------------------
-// Content normalization
-// ----------------------------------------------------------------------------
-
-function normalizeContent(content: string | ContentPart[] | unknown): ContentPart[] {
-  if (typeof content === "string") return [{ type: "text", text: content }];
-  if (!Array.isArray(content)) return [];
-  const out: ContentPart[] = [];
-  for (const p of content as Array<Record<string, unknown>>) {
-    if (!p || typeof p !== "object") continue;
-    if (p.type === "text" && typeof p.text === "string") {
-      out.push({ type: "text", text: p.text });
-    } else if (p.type === "image_url" && p.image_url) {
-      const imgRef = p.image_url as string | { url?: string };
-      const url: string = typeof imgRef === "string" ? imgRef : (imgRef.url ?? "");
-      const m = url.match(/^data:([^;]+);base64,(.+)$/);
-      if (m) out.push({ type: "image", mimeType: m[1], base64Data: m[2] });
-    }
-  }
-  return out;
-}
-
-function contentToText(content: string | ContentPart[]): string {
-  if (typeof content === "string") return content;
-  return content
-    .filter((p): p is { type: "text"; text: string } => p.type === "text")
-    .map((p) => p.text)
-    .join("\n");
-}
-
-// ----------------------------------------------------------------------------
 // WebSocket connection pool
 // ----------------------------------------------------------------------------
 
-interface WsConnection {
-  ws: WebSocket;
-  host: string;
+const WS_CONNECT_TIMEOUT_MS = 15_000;
+const WS_IDLE_TIMEOUT_MS = 30_000;
+
+interface WsConn {
+  ws: WS;
   apiKey: string;
-  lastUsed: number;
-  alive: boolean;
+  backendUrl: string;
+  createdAt: number;
+  lastUsedAt: number;
+  busy: boolean;
 }
 
-const connections = new Map<string, WsConnection>();
-let pingInterval: ReturnType<typeof setInterval> | null = null;
+let pooled: WsConn | null = null;
 
-function connKey(host: string, apiKey: string): string {
-  return `${host}\x1f${apiKey}`;
-}
-
-function ensurePingInterval(): void {
-  if (pingInterval) return;
-  pingInterval = setInterval(() => {
-    for (const [key, conn] of connections) {
-      if (!conn.alive || Date.now() - conn.lastUsed > WS_IDLE_TIMEOUT_MS) {
-        try { conn.ws.close(); } catch {}
-        connections.delete(key);
-        continue;
-      }
-      conn.alive = false;
-      try { conn.ws.ping(); } catch {}
-    }
-  }, WS_PING_INTERVAL_MS);
-}
-
-async function getConnection(
-  backendUrl: string,
-  apiKey: string,
-  authToken: string,
-  signal?: AbortSignal,
-): Promise<WsConnection> {
-  const host = backendUrl.replace(/\/$/, "");
-  const key = connKey(host, apiKey);
-  const existing = connections.get(key);
-  if (existing && existing.ws.readyState === WebSocket.OPEN) {
-    existing.lastUsed = Date.now();
-    existing.alive = true;
-    return existing;
+function idleSweep() {
+  if (!pooled) return;
+  const now = Date.now();
+  if (now - pooled.lastUsedAt > WS_IDLE_TIMEOUT_MS) {
+    try { pooled.ws.close(); } catch {}
+    pooled = null;
   }
+}
 
+setInterval(idleSweep, 10_000);
+
+function connectWs(apiKey: string, backendUrl: string): Promise<WsConn> {
+  const host = backendUrl.replace(/\/$/, "");
   const wsUrl = host.replace(/^http/, "ws") + "/ws";
-  const ws = new WebSocket(wsUrl, {
-    headers: { authToken },
-  });
 
-  const conn = await new Promise<WsConnection>((resolve, reject) => {
+  return new Promise<WsConn>((resolve, reject) => {
+    let settled = false;
     const timer = setTimeout(() => {
-      ws.close();
-      reject(new CloudChatError(`WebSocket connect timeout (${WS_CONNECT_TIMEOUT_MS}ms)`, "timeout"));
+      if (!settled) {
+        settled = true;
+        try { ws.close(); } catch {}
+        reject(new CloudChatError(`WebSocket connect timeout (${WS_CONNECT_TIMEOUT_MS}ms)`, "timeout"));
+      }
     }, WS_CONNECT_TIMEOUT_MS);
 
-    const onAbort = () => {
-      clearTimeout(timer);
-      ws.close();
-      reject(new CloudChatError("WebSocket connect cancelled", "cancelled"));
-    };
-    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    const ws = new WS(wsUrl, { headers: { authToken: apiKey } });
 
-    ws.on("open", () => {
+    ws.addEventListener("open", () => {
       clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      const connection: WsConnection = {
-        ws,
-        host,
-        apiKey,
-        lastUsed: Date.now(),
-        alive: true,
-      };
-      connections.set(key, connection);
-      ensurePingInterval();
-      resolve(connection);
+      if (!settled) {
+        settled = true;
+        resolve({
+          ws,
+          apiKey,
+          backendUrl,
+          createdAt: Date.now(),
+          lastUsedAt: Date.now(),
+          busy: false,
+        });
+      }
     });
 
-    ws.on("error", (err) => {
+    ws.addEventListener("error", () => {
       clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      reject(new CloudChatError(`WebSocket error: ${err.message}`, "ws_error"));
+      if (!settled) {
+        settled = true;
+        reject(new CloudChatError("WebSocket connection failed", "ws_error"));
+      }
     });
 
-    ws.on("pong", () => {
-      const c = connections.get(key);
-      if (c) c.alive = true;
+    ws.addEventListener("close", () => {
+      clearTimeout(timer);
+      if (!settled) {
+        settled = true;
+        reject(new CloudChatError("WebSocket closed during connect", "ws_closed"));
+      }
     });
+
+    if (typeof AbortController !== "undefined") {
+      const ac = new AbortController();
+      ac.signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        if (!settled) {
+          settled = true;
+          try { ws.close(); } catch {}
+          reject(new CloudChatError("WebSocket connect cancelled", "cancelled"));
+        }
+      }, { once: true });
+    }
   });
+}
 
+async function getConn(apiKey: string, backendUrl: string): Promise<WsConn> {
+  if (pooled && pooled.apiKey === apiKey && pooled.backendUrl === backendUrl) {
+    if (pooled.ws.readyState === WS.OPEN && !pooled.busy) {
+      pooled.lastUsedAt = Date.now();
+      return pooled;
+    }
+    try { pooled.ws.close(); } catch {}
+    pooled = null;
+  }
+  const conn = await connectWs(apiKey, backendUrl);
+  pooled = conn;
   return conn;
 }
 
-export function clearSessionIds(): void {
-  for (const [, conn] of connections) {
-    try { conn.ws.close(); } catch {}
-  }
-  connections.clear();
-  if (pingInterval) {
-    clearInterval(pingInterval);
-    pingInterval = null;
-  }
-}
+// ----------------------------------------------------------------------------
+// Request builder
+// ----------------------------------------------------------------------------
 
-// ----------------------------------------------------------------------------
-// Message builders
-// ----------------------------------------------------------------------------
+function contentToText(content: ChatMessage["content"]): string {
+  if (typeof content === "string") return content;
+  return content
+    .map((p) => {
+      if (p.type === "text") return String((p as { text?: string }).text ?? "");
+      if (p.type === "image_url") return "[image]";
+      if (p.type === "image_file") return "[image]";
+      return "";
+    })
+    .join("");
+}
 
 function buildChatRequest(req: CloudChatRequest): string {
   const messages = req.messages.map((m) => ({
@@ -250,268 +239,294 @@ function buildChatRequest(req: CloudChatRequest): string {
 // Response decoder
 // ----------------------------------------------------------------------------
 
-function* decodeFreebuffEvents(
-  envelope: FreebuffEnvelope,
-  requestId: string,
-): Generator<CloudChatEvent> {
-  // Handle ping/pong
-  if (envelope.type === "ping") return;
-  if (envelope.type === "pong") return;
+interface DecodeResult {
+  done: boolean;
+  textDeltas: string[];
+  thinkingDeltas: string[];
+  toolCalls: Array<{ index: number; id: string; name: string; arguments: string }>;
+  finishReason: string | null;
+  usage: { input_tokens: number; output_tokens: number } | null;
+  error: string | null;
+}
 
-  // Handle JSON-RPC response
+function decodeStreamEvent(raw: string): DecodeResult {
+  const result: DecodeResult = {
+    done: false,
+    textDeltas: [],
+    thinkingDeltas: [],
+    toolCalls: [],
+    finishReason: null,
+    usage: null,
+    error: null,
+  };
+
+  const envelope = parseFreebuffMessage(raw);
+  if (!envelope) return result;
+
+  // Handle error events
+  if (envelope.type === "event" && envelope.event === "error") {
+    const data = envelope.data as Record<string, unknown>;
+    result.error = String(data?.message ?? data?.error ?? "Unknown backend error");
+    result.done = true;
+    return result;
+  }
+
+  // Handle completion events
+  if (envelope.type === "event" && envelope.event === "complete") {
+    const data = envelope.data as Record<string, unknown>;
+    result.finishReason = String(data?.reason ?? "stop");
+    if (data.usage) {
+      result.usage = data.usage as { input_tokens: number; output_tokens: number };
+    }
+    result.done = true;
+    return result;
+  }
+
+  // Handle JSON-RPC responses with content deltas
   if (envelope.type === "message" && envelope.message) {
-    const msg = envelope.message;
+    const msg = envelope.message as Record<string, unknown>;
+
+    // Check for result (completion)
+    if ("result" in msg) {
+      result.done = true;
+      result.finishReason = "stop";
+      return result;
+    }
 
     // Check for error
     if ("error" in msg) {
-      const err = msg as { error: { code: number; message: string } };
-      throw new CloudChatError(err.error.message, String(err.error.code));
+      result.error = String((msg.error as Record<string, unknown>)?.message ?? "JSON-RPC error");
+      result.done = true;
+      return result;
     }
 
-    // Check for result
-    if ("result" in msg) {
-      const result = msg.result as Record<string, unknown>;
+    // Handle streaming chunks
+    if ("choices" in msg) {
+      const choices = msg.choices as Array<Record<string, unknown>>;
+      for (const choice of choices) {
+        const delta = choice.delta as Record<string, unknown> | undefined;
+        if (!delta) continue;
 
-      // Streaming text delta
-      if (result.type === "text" || result.type === "text_delta") {
-        const text = result.text ?? result.delta ?? "";
-        if (typeof text === "string" && text) {
-          yield { kind: "text", text };
+        // Text content
+        if (typeof delta.content === "string" && delta.content) {
+          result.textDeltas.push(delta.content);
         }
-      }
 
-      // Reasoning/thinking delta
-      if (result.type === "reasoning" || result.type === "thinking_delta") {
-        const text = result.text ?? result.delta ?? "";
-        if (typeof text === "string" && text) {
-          yield { kind: "reasoning", text };
+        // Tool calls
+        if (delta.tool_calls) {
+          const toolCalls = delta.tool_calls as Array<Record<string, unknown>>;
+          for (const tc of toolCalls) {
+            const fn = tc.function as Record<string, unknown> | undefined;
+            result.toolCalls.push({
+              index: typeof tc.index === "number" ? tc.index : 0,
+              id: String(tc.id ?? ""),
+              name: String(fn?.name ?? ""),
+              arguments: String(fn?.arguments ?? ""),
+            });
+          }
         }
-      }
 
-      // Tool call start
-      if (result.type === "tool_call_start") {
-        const id = result.id ?? result.tool_call_id ?? "";
-        const name = result.name ?? result.tool_name ?? "";
-        if (typeof id === "string" && typeof name === "string") {
-          yield { kind: "tool_call_start", id, name };
+        // Finish reason
+        if (choice.finish_reason) {
+          result.finishReason = String(choice.finish_reason);
         }
-      }
-
-      // Tool call arguments
-      if (result.type === "tool_call_args" || result.type === "tool_call_delta") {
-        const argsDelta = result.arguments ?? result.args_delta ?? result.delta ?? "";
-        const id = result.id ?? result.tool_call_id;
-        if (typeof argsDelta === "string") {
-          yield {
-            kind: "tool_call_args",
-            argsDelta,
-            ...(typeof id === "string" ? { id } : {}),
-          };
-        }
-      }
-
-      // Finish
-      if (result.type === "done" || result.type === "finished" || result.type === "complete") {
-        yield { kind: "finish", reason: "stop" };
-      }
-
-      // Error in result
-      if (result.type === "error") {
-        const message = result.message ?? result.error ?? "Unknown error";
-        throw new CloudChatError(String(message), "stream_error");
       }
 
       // Usage
-      if (result.usage) {
-        const usage = result.usage as Record<string, unknown>;
-        yield {
-          kind: "usage",
-          promptTokens: typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : undefined,
-          completionTokens: typeof usage.completion_tokens === "number" ? usage.completion_tokens : undefined,
-          totalTokens: typeof usage.total_tokens === "number" ? usage.total_tokens : undefined,
-        };
+      if (msg.usage) {
+        result.usage = msg.usage as { input_tokens: number; output_tokens: number };
       }
-
-      // Metadata
-      yield {
-        kind: "meta",
-        fields: {
-          outputId: result.output_id as string | undefined,
-          requestId: result.request_id as string | undefined,
-          model: result.model as string | undefined,
-          rawFields: result,
-        },
-      };
     }
   }
 
-  // Handle event type
-  if (envelope.type === "event") {
-    const event = envelope.event ?? "";
-    const data = envelope.data as Record<string, unknown> | undefined;
-
-    if (event === "text" || event === "text_delta") {
-      const text = data?.text ?? data?.delta ?? "";
-      if (typeof text === "string" && text) {
-        yield { kind: "text", text };
-      }
+  // Handle action-type messages
+  if (envelope.type === "action" && envelope.action) {
+    const data = envelope.data as Record<string, unknown>;
+    if (envelope.action === "content_delta" && typeof data?.text === "string") {
+      result.textDeltas.push(data.text);
     }
-
-    if (event === "reasoning" || event === "thinking_delta") {
-      const text = data?.text ?? data?.delta ?? "";
-      if (typeof text === "string" && text) {
-        yield { kind: "reasoning", text };
-      }
+    if (envelope.action === "thinking_delta" && typeof data?.text === "string") {
+      result.thinkingDeltas.push(data.text);
     }
-
-    if (event === "tool_call" || event === "tool_call_start") {
-      const id = data?.id ?? data?.tool_call_id ?? "";
-      const name = data?.name ?? data?.tool_name ?? "";
-      if (typeof id === "string" && typeof name === "string") {
-        yield { kind: "tool_call_start", id, name };
-      }
+    if (envelope.action === "tool_call" && data?.name) {
+      result.toolCalls.push({
+        index: 0,
+        id: String(data.id ?? crypto.randomUUID()),
+        name: String(data.name),
+        arguments: typeof data.arguments === "string" ? data.arguments : JSON.stringify(data.arguments ?? {}),
+      });
     }
-
-    if (event === "tool_call_args" || event === "tool_call_delta") {
-      const argsDelta = data?.arguments ?? data?.args_delta ?? data?.delta ?? "";
-      const id = data?.id ?? data?.tool_call_id;
-      if (typeof argsDelta === "string") {
-        yield {
-          kind: "tool_call_args",
-          argsDelta,
-          ...(typeof id === "string" ? { id } : {}),
-        };
-      }
-    }
-
-    if (event === "done" || event === "finished" || event === "complete") {
-      yield { kind: "finish", reason: "stop" };
-    }
-
-    if (event === "error") {
-      const message = data?.message ?? data?.error ?? "Unknown error";
-      throw new CloudChatError(String(message), "stream_error");
-    }
-
-    if (event === "usage" && data) {
-      yield {
-        kind: "usage",
-        promptTokens: typeof data.prompt_tokens === "number" ? data.prompt_tokens : undefined,
-        completionTokens: typeof data.completion_tokens === "number" ? data.completion_tokens : undefined,
-        totalTokens: typeof data.total_tokens === "number" ? data.total_tokens : undefined,
-      };
+    if (envelope.action === "done") {
+      result.done = true;
+      result.finishReason = "stop";
     }
   }
+
+  return result;
 }
 
 // ----------------------------------------------------------------------------
-// Public API: streamChatEvents
+// Main streaming function
 // ----------------------------------------------------------------------------
 
-export async function* streamChatEvents(req: CloudChatRequest): AsyncGenerator<CloudChatEvent> {
-  const host = req.backendUrl.replace(/\/$/, "");
-  const requestId = crypto.randomUUID();
-
-  // Get or create WebSocket connection
-  const conn = await getConnection(host, req.apiKey, req.apiKey, req.signal);
-
-  // Build and send request
+export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
+  const conn = await getConn(req.apiKey, req.backendUrl);
   const requestJson = buildChatRequest(req);
-  conn.ws.send(requestJson);
-  conn.lastUsed = Date.now();
 
-  // Collect responses
-  let finished = false;
-  let error: Error | null = null;
+  // Accumulator for tool call arguments
+  const toolCallAccum: Map<number, { id: string; name: string; args: string }> = new Map();
 
-  const messagePromise = new Promise<FreebuffEnvelope[]>((resolve) => {
-    const messages: FreebuffEnvelope[] = [];
-    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  return new Promise<void>((resolve, reject) => {
+    let finished = false;
 
-    const resetIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        resolve(messages);
-      }, WS_IDLE_TIMEOUT_MS);
-    };
+    const finish = (reason: string, err?: unknown) => {
+      if (finished) return;
+      finished = true;
 
-    const onMessage = (data: WebSocket.RawData) => {
-      const raw = data.toString("utf8");
-      const envelope = parseFreebuffMessage(raw);
-      if (envelope) {
-        messages.push(envelope);
-        resetIdle();
-
-        // Check for terminal events
-        if (envelope.type === "event") {
-          const event = envelope.event ?? "";
-          if (event === "done" || event === "finished" || event === "complete" || event === "error") {
-            finished = true;
-            if (idleTimer) clearTimeout(idleTimer);
-            conn.ws.removeListener("message", onMessage);
-            resolve(messages);
-          }
+      // Flush any accumulated tool calls
+      for (const [, tc] of toolCallAccum) {
+        if (tc.name && tc.args) {
+          try {
+            req.callbacks.onToolCall?.(tc.name, JSON.parse(tc.args));
+          } catch {}
         }
-        if (envelope.type === "message" && envelope.message) {
-          const msg = envelope.message;
-          if ("result" in msg) {
-            const result = msg.result as Record<string, unknown>;
-            if (result.type === "done" || result.type === "finished" || result.type === "complete") {
-              finished = true;
-              if (idleTimer) clearTimeout(idleTimer);
-              conn.ws.removeListener("message", onMessage);
-              resolve(messages);
-            }
-            if (result.type === "error") {
-              finished = true;
-              error = new Error(String(result.message ?? result.error));
-              if (idleTimer) clearTimeout(idleTimer);
-              conn.ws.removeListener("message", onMessage);
-              resolve(messages);
-            }
-          }
-          if ("error" in msg) {
-            finished = true;
-            const err = msg as { error: { message: string } };
-            error = new Error(err.error.message);
-            if (idleTimer) clearTimeout(idleTimer);
-            conn.ws.removeListener("message", onMessage);
-            resolve(messages);
-          }
-        }
+      }
+      toolCallAccum.clear();
+
+      try { conn.ws.close(); } catch {}
+      if (pooled === conn) pooled = null;
+
+      if (err) {
+        req.callbacks.onError?.(err);
+        reject(err);
+      } else {
+        req.callbacks.onFinish?.(reason);
+        resolve();
       }
     };
 
-    conn.ws.on("message", onMessage);
-    resetIdle();
+    // Abort signal
+    req.signal?.addEventListener("abort", () => {
+      finish("aborted", new CloudChatError("Request aborted", "aborted"));
+    }, { once: true });
 
-    // Handle abort
-    if (req.signal) {
-      req.signal.addEventListener("abort", () => {
-        if (idleTimer) clearTimeout(idleTimer);
-        conn.ws.removeListener("message", onMessage);
-        resolve(messages);
-      }, { once: true });
+    // Timeout
+    const timer = setTimeout(() => {
+      finish("timeout", new CloudChatError("Stream timeout (5 minutes)", "timeout"));
+    }, 5 * 60 * 1000);
+
+    req.callbacks.onStart?.();
+
+    const onData = (event: MessageEvent) => {
+      if (finished) return;
+      conn.lastUsedAt = Date.now();
+
+      const raw = typeof event.data === "string" ? event.data : String(event.data);
+      const result = decodeStreamEvent(raw);
+
+      if (result.error) {
+        clearTimeout(timer);
+        finish("error", new CloudChatError(result.error, "backend_error"));
+        return;
+      }
+
+      // Emit thinking deltas
+      for (const td of result.thinkingDeltas) {
+        req.callbacks.onThinking?.(td);
+      }
+
+      // Emit text deltas
+      for (const td of result.textDeltas) {
+        req.callbacks.onText?.(td);
+      }
+
+      // Accumulate tool calls
+      for (const tc of result.toolCalls) {
+        let acc = toolCallAccum.get(tc.index);
+        if (!acc) {
+          acc = { id: tc.id || crypto.randomUUID(), name: tc.name, args: "" };
+          toolCallAccum.set(tc.index, acc);
+        }
+        if (tc.id) acc.id = tc.id;
+        if (tc.name) acc.name = tc.name;
+        if (tc.arguments) acc.args += tc.arguments;
+      }
+
+      // Handle completion
+      if (result.done) {
+        clearTimeout(timer);
+        finish(result.finishReason ?? "stop");
+        return;
+      }
+    };
+
+    const onError = (event: Event) => {
+      if (finished) return;
+      clearTimeout(timer);
+      const msg = event instanceof ErrorEvent ? event.message : "WebSocket error";
+      finish("error", new CloudChatError(msg, "ws_error"));
+    };
+
+    const onClose = () => {
+      if (finished) return;
+      clearTimeout(timer);
+      finish("closed");
+    };
+
+    conn.ws.addEventListener("message", onData);
+    conn.ws.addEventListener("error", onError);
+    conn.ws.addEventListener("close", onClose);
+
+    // Send the request
+    try {
+      conn.ws.send(requestJson);
+    } catch (err) {
+      clearTimeout(timer);
+      conn.ws.removeEventListener("message", onData);
+      conn.ws.removeEventListener("error", onError);
+      conn.ws.removeEventListener("close", onClose);
+      finish("send_error", err instanceof Error ? err : new Error(String(err)));
     }
   });
+}
 
-  const messages = await messagePromise;
+// ----------------------------------------------------------------------------
+// Non-streaming request (used for tool result submission)
+// ----------------------------------------------------------------------------
 
-  // Yield decoded events
-  for (const envelope of messages) {
-    if (error && !(envelope.type === "message" && "error" in (envelope.message ?? {}))) {
-      // Already captured error
-    }
-    yield* decodeFreebuffEvents(envelope, requestId);
-  }
+export async function submitToolResult(
+  apiKey: string,
+  backendUrl: string,
+  toolCallId: string,
+  result: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const conn = await getConn(apiKey, backendUrl);
+  const jsonRpcMsg = buildJsonRpcRequest("tool_result", {
+    tool_call_id: toolCallId,
+    result,
+  });
+  const requestJson = buildFreebuffMessage(jsonRpcMsg);
 
-  // Throw if error was captured
-  if (error) {
-    throw new CloudChatError(error.message, "stream_error");
-  }
+  return new Promise<void>((resolve, reject) => {
+    let finished = false;
 
-  // If we didn't get a finish event, emit one
-  if (!finished) {
-    yield { kind: "finish", reason: "stop" };
-  }
+    const finish = (err?: unknown) => {
+      if (finished) return;
+      finished = true;
+      try { conn.ws.close(); } catch {}
+      if (pooled === conn) pooled = null;
+      if (err) reject(err);
+      else resolve();
+    };
+
+    signal?.addEventListener("abort", () => finish(new CloudChatError("Aborted", "aborted")), { once: true });
+    const timer = setTimeout(() => finish(new CloudChatError("Timeout", "timeout")), 30_000);
+
+    const onData = () => { clearTimeout(timer); finish(); };
+    conn.ws.addEventListener("message", onData, { once: true });
+    conn.ws.addEventListener("error", () => { clearTimeout(timer); finish(new CloudChatError("WS error", "ws_error")); }, { once: true });
+
+    try { conn.ws.send(requestJson); } catch (err) { clearTimeout(timer); finish(err); }
+  });
 }

@@ -7,6 +7,9 @@
 import * as crypto from "crypto";
 import { buildFreebuffMessage, buildJsonRpcRequest, parseFreebuffMessage, type FreebuffEnvelope } from "./wire";
 
+// Use native WebSocket (Node 22+)
+const WS = globalThis.WebSocket;
+
 // ----------------------------------------------------------------------------
 // Types
 // ----------------------------------------------------------------------------
@@ -63,7 +66,7 @@ async function fetchCatalog(
   const wsUrl = host.replace(/^http/, "ws") + "/ws";
 
   // Connect to backend WebSocket to fetch model list
-  const ws = new WebSocket(wsUrl, { headers: { authToken: apiKey } });
+  const ws = new WS(wsUrl, { headers: { authToken: apiKey } });
 
   const catalog = await new Promise<CacheEntry>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -73,15 +76,14 @@ async function fetchCatalog(
 
     const models = new Map<string, ModelCatalogEntry>();
 
-    ws.onopen = () => {
-      // Send a model list request
+    ws.addEventListener("open", () => {
       const request = buildFreebuffMessage(
         buildJsonRpcRequest("get_models", { include_disabled: false }),
       );
       ws.send(request);
-    };
+    });
 
-    ws.onmessage = (event) => {
+    ws.addEventListener("message", (event) => {
       const raw = typeof event.data === "string" ? event.data : String(event.data);
       const envelope = parseFreebuffMessage(raw);
       if (!envelope) return;
@@ -143,21 +145,20 @@ async function fetchCatalog(
       }
     };
 
-    ws.onerror = () => {
+    ws.addEventListener("error", () => {
       clearTimeout(timer);
       ws.close();
-      // Return empty catalog on error — will use fallback
       resolve({ byUid: new Map(), fetchedAt: Date.now(), apiKey, backendUrl });
-    };
+    });
 
-    ws.onclose = () => {
+    ws.addEventListener("close", () => {
       clearTimeout(timer);
       if (models.size > 0) {
         resolve({ byUid: models, fetchedAt: Date.now(), apiKey, backendUrl });
       } else {
         resolve({ byUid: new Map(), fetchedAt: Date.now(), apiKey, backendUrl });
       }
-    };
+    });
 
     if (signal) {
       signal.addEventListener("abort", () => {
