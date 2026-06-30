@@ -13,7 +13,7 @@ import { getCachedCatalog, clearCachedCatalog, type ModelCatalogEntry } from "./
 
 let _pi: ExtensionAPI | null = null;
 
-function catalogModelToPi(m: ModelCatalogEntry) {
+function catalogModelToPi(m: ModelCatalogEntry, allModels: ModelCatalogEntry[]) {
   const ctx = m.contextWindow ?? 0;
   const maxOut = m.maxOutputTokens ?? 0;
   const tags: string[] = [];
@@ -21,9 +21,12 @@ function catalogModelToPi(m: ModelCatalogEntry) {
   if (m.isThinking) tags.push("Thinking");
   const tagStr = tags.length > 0 ? ` [${tags.join(" ")}]` : "";
   const ctxStr = ctx > 0 ? ` (${ctx >= 1_000_000 ? `${Math.round(ctx / 1_000_000)}M` : `${Math.round(ctx / 1_000)}K`})` : "";
+  // If another model has the same label, prefix with provider
+  const hasDupe = allModels.some((other) => other !== m && other.label === m.label);
+  const displayName = hasDupe ? `${m.provider}/${m.label}` : m.label;
   return {
     id: m.modelUid,
-    name: `${m.label}${tagStr}${ctxStr}`,
+    name: `${displayName}${tagStr}${ctxStr}`,
     reasoning: m.features?.supportsThinking ?? false,
     input: ["text", ...(m.features?.supportsImageCaptions !== false ? ["image"] : [])] as ("text" | "image")[],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -36,14 +39,15 @@ async function buildDynamicModels(apiKey: string): Promise<ReturnType<typeof cat
   try {
     const catalog = await getCachedCatalog(apiKey);
     if (catalog && catalog.byUid.size > 0) {
-      const models = [...catalog.byUid.values()].filter((m) => !m.disabled).map(catalogModelToPi);
+      const allEntries = [...catalog.byUid.values()];
+      const models = allEntries.filter((m) => !m.disabled).map((m) => catalogModelToPi(m, allEntries));
       console.error(`[freebuff] loaded ${models.length} models from catalog`);
       return models;
     }
   } catch (e) {
     console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-  return getAllModels().map(catalogModelToPi);
+  return getAllModels().map((m) => catalogModelToPi(m, getAllModels()));
 }
 
 async function loginFreebuff(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
