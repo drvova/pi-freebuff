@@ -41,7 +41,7 @@ export const DEFAULT_REGION: FreebuffRegion = {
 
 // ---- Credential storage ----
 
-const APP_DIR_NAME = "opencode-freebuff-auth";
+const APP_DIR_NAME = "pi-freebuff";
 const CREDS_FILENAME = "credentials.json";
 
 function getCredentialsDir(): string {

@@ -25,8 +25,8 @@ export interface ModelCatalogEntry {
 
 // ---- Source URL ----
 
-const FREE_AGENTS_SOURCE_URL =
-  "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/free-agents.ts";
+const FREE_MODELS_SOURCE_URL =
+  "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/freebuff-models.ts";
 
 // ---- Known model variable mappings (from freebuff-models.ts) ----
 
@@ -70,27 +70,21 @@ function httpsGet(url: string): Promise<string> {
 function extractModelsFromSource(source: string): string[] {
   const models = new Set<string>();
 
-  // Pattern 1: 'model-id': new Set([...])
-  const literalRe = /'([^']+)':\s*new\s+Set\(\[([^\]]*)\]\)/g;
+  // Pattern 1: export const FREEBUFF_*_MODEL_ID = 'model-id'
+  const exportRe = /export\s+const\s+(FREEBUFF_\w+_MODEL_ID)\s*=\s*'([^']+)'/g;
   let match: RegExpExecArray | null;
-  while ((match = literalRe.exec(source)) !== null) {
-    const inner = match[2];
-    const modelRe = /'([^']+)'/g;
-    let m: RegExpExecArray | null;
-    while ((m = modelRe.exec(inner)) !== null) {
-      const model = m[1].trim();
-      if (model) models.add(model);
-    }
-    for (const [varName, modelId] of Object.entries(KNOWN_MODEL_VARS)) {
-      if (inner.includes(varName)) models.add(modelId);
+  while ((match = exportRe.exec(source)) !== null) {
+    const value = match[2].trim();
+    if (value.includes("/") && !value.startsWith("minimaxModels") && !value.startsWith("mimoModels")) {
+      KNOWN_MODEL_VARS[match[1]] = value;
+      models.add(value);
     }
   }
 
-  // Pattern 2: 'agent-id': new Set(VARIABLE_NAME)
-  const refRe = /'([^']+)':\s*new\s+Set\((\w+)\)/g;
-  while ((match = refRe.exec(source)) !== null) {
-    const varName = match[2];
-    const modelId = KNOWN_MODEL_VARS[varName];
+  // Pattern 2: id: FREEBUFF_*_MODEL_ID — variable refs in object literals
+  const idRe = /id:\s*(FREEBUFF_\w+_MODEL_ID)/g;
+  while ((match = idRe.exec(source)) !== null) {
+    const modelId = KNOWN_MODEL_VARS[match[1]];
     if (modelId) models.add(modelId);
   }
 
@@ -102,12 +96,19 @@ function extractModelsFromSource(source: string): string[] {
     if (modelId) models.add(modelId);
   }
 
-  // Pattern 4: id: VARIABLE
-  const idRe = /id:\s*([A-Z_]+)/g;
-  while ((match = idRe.exec(source)) !== null) {
-    const varName = match[1];
-    const modelId = KNOWN_MODEL_VARS[varName];
-    if (modelId) models.add(modelId);
+  // Pattern 4: 'model-id': new Set([...])
+  const literalRe = /'([^']+)':\s*new\s+Set\(\[([^\]]*)\]\)/g;
+  while ((match = literalRe.exec(source)) !== null) {
+    const inner = match[2];
+    const modelRe = /'([^']+)'/g;
+    let m: RegExpExecArray | null;
+    while ((m = modelRe.exec(inner)) !== null) {
+      const model = m[1].trim();
+      if (model) models.add(model);
+    }
+    for (const [varName, modelId] of Object.entries(KNOWN_MODEL_VARS)) {
+      if (inner.includes(varName)) models.add(modelId);
+    }
   }
 
   return [...models].sort();
@@ -123,7 +124,7 @@ interface DiskCache {
 const DISK_CACHE_TTL_MS = 6 * 3600_000;
 
 function getDiskCachePath(): string {
-  return path.join(os.homedir(), ".config", "opencode-freebuff-auth", "models.json");
+  return path.join(os.homedir(), ".config", "pi-freebuff", "models.json");
 }
 
 function loadDiskCache(): DiskCache | null {
@@ -194,7 +195,7 @@ export async function getCachedCatalog(
   // 3. Fetch from source
   try {
     console.error("[freebuff] catalog: fetching from source...");
-    const source = await httpsGet(FREE_AGENTS_SOURCE_URL);
+    const source = await httpsGet(FREE_MODELS_SOURCE_URL);
     const modelIds = extractModelsFromSource(source);
     if (modelIds.length > 0) {
       cached = buildCache(modelIds);
