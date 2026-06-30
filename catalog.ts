@@ -61,7 +61,7 @@ function extractModelsFromSource(source: string): string[] {
   let match: RegExpExecArray | null;
   while ((match = exportRe.exec(source)) !== null) {
     const value = match[2].trim();
-    if (value.includes("/") && !value.startsWith("minimaxModels") && !value.startsWith("mimoModels")) {
+    if (value.includes("/") && !value.startsWith("minimaxModels") && !value.startsWith("mimoModels") && !value.startsWith("fireworks/")) {
       KNOWN_MODEL_VARS[match[1]] = value;
       models.add(value);
     }
@@ -89,7 +89,7 @@ function extractModelsFromSource(source: string): string[] {
     let m: RegExpExecArray | null;
     while ((m = modelRe.exec(inner)) !== null) {
       const model = m[1].trim();
-      if (model) models.add(model);
+      if (model && !model.startsWith("fireworks/")) models.add(model);
     }
     for (const [varName, modelId] of Object.entries(KNOWN_MODEL_VARS)) {
       if (inner.includes(varName)) models.add(modelId);
