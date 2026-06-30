@@ -108,9 +108,14 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         }
       } catch {}
       if (allModels.length === 0) allModels = getAllModels();
-      const data = allModels.map((m) => ({ id: m.modelUid, object: "model" as const, created: Math.floor(Date.now() / 1000), owned_by: "freebuff" }));
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ object: "list", data }));
+      if (allModels.length > 0) {
+        const data = allModels.map((m) => ({ id: m.modelUid, object: "model" as const, created: Math.floor(Date.now() / 1000), owned_by: "freebuff" }));
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ object: "list", data }));
+      } else {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ object: "list", data: [] }));
+      }
       return;
     }
 

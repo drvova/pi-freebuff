@@ -38,5 +38,8 @@ export async function resolveModel(
 }
 
 export function getDefaultModel(): string {
+  if (cachedCatalog?.byUid && cachedCatalog.byUid.size > 0) {
+    return cachedCatalog.byUid.keys().next().value!;
+  }
   return "deepseek/deepseek-v4-pro";
 }

@@ -1,7 +1,7 @@
 /**
  * Dynamic model catalog for Freebuff.
  * Fetches live model list from Codebuff's free-agents.ts source file.
- * Falls back to hardcoded list if fetch fails.
+ * No hardcoded fallback — if the fetch fails, no models are available.
  */
 
 // ---- Types ----
@@ -64,7 +64,6 @@ function extractModelsFromSource(source: string): string[] {
       const model = m[1].trim();
       if (model) models.add(model);
     }
-    // Resolve known variable references
     for (const [varName, modelId] of Object.entries(KNOWN_MODEL_VARS)) {
       if (inner.includes(varName)) models.add(modelId);
     }
@@ -76,7 +75,6 @@ function extractModelsFromSource(source: string): string[] {
     const varName = match[2];
     const knownModels = KNOWN_MODEL_SETS[varName];
     if (knownModels) knownModels.forEach((m) => models.add(m));
-    // Also check variable mappings
     const modelId = KNOWN_MODEL_VARS[varName];
     if (modelId) models.add(modelId);
   }
@@ -91,7 +89,7 @@ interface CacheEntry {
   fetchedAt: number;
 }
 
-const CATALOG_TTL_MS = 6 * 3600_000; // 6 hours (same as freebuff-proxy)
+const CATALOG_TTL_MS = 6 * 3600_000;
 let cached: CacheEntry | null = null;
 
 function modelToEntry(modelUid: string): ModelCatalogEntry {
@@ -138,18 +136,12 @@ export async function getCachedCatalog(
     console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  // Fallback: use known models
-  const fallbackModels = Object.values(KNOWN_MODEL_VARS);
-  const byUid = new Map<string, ModelCatalogEntry>();
-  for (const id of fallbackModels) byUid.set(id, modelToEntry(id));
-  cached = { byUid, fetchedAt: now };
-  console.error(`[freebuff] catalog: using fallback ${fallbackModels.length} models`);
-  return cached;
+  return null;
 }
 
 export function clearCachedCatalog(): void { cached = null; }
 export function getCatalogEntry(modelUid: string): ModelCatalogEntry | undefined { return cached?.byUid.get(modelUid); }
 export function getAllModels(): ModelCatalogEntry[] {
-  const fallbackModels = Object.values(KNOWN_MODEL_VARS);
-  return fallbackModels.map(modelToEntry);
+  if (cached) return [...cached.byUid.values()];
+  return [];
 }

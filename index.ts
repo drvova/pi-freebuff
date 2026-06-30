@@ -9,7 +9,7 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-a
 import { startProxy, stopProxy, PROXY_SECRET, setProxyCredentials } from "./proxy";
 import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runLoginLoopback, type PersistedCredentials } from "./oauth";
 import { clearSessionIds } from "./chat";
-import { getAllModels, getCachedCatalog, clearCachedCatalog, type ModelCatalogEntry } from "./catalog";
+import { getCachedCatalog, clearCachedCatalog, type ModelCatalogEntry } from "./catalog";
 
 let _pi: ExtensionAPI | null = null;
 
@@ -83,14 +83,13 @@ export default async function (pi: ExtensionAPI) {
     }
   } catch {}
 
-  const fallbackModels = getAllModels().map(catalogModelToPi);
   pi.registerProvider("freebuff", {
     name: "Freebuff (Codebuff)",
     baseUrl,
     apiKey: PROXY_SECRET,
     api: "openai-completions",
     authHeader: true,
-    models: fallbackModels,
+    models: [],
     oauth: {
       name: "Freebuff (Codebuff)",
       login: loginFreebuff,
@@ -105,7 +104,7 @@ export default async function (pi: ExtensionAPI) {
     }).catch(() => {});
   }
 
-  console.error(hasCreds ? `[freebuff] connected — ${fallbackModels.length} models` : `[freebuff] /freebuff-login to connect`);
+  console.error(hasCreds ? `[freebuff] connected` : `[freebuff] /freebuff-login to connect`);
 
   pi.registerCommand("freebuff-status", {
     description: "Show Freebuff auth status",
