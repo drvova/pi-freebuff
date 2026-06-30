@@ -1,8 +1,13 @@
 /**
  * Dynamic model catalog for Freebuff.
  * Fetches live model list from Codebuff's free-agents.ts source file.
- * No hardcoded fallback — if the fetch fails, no models are available.
+ * Uses Node https module for reliable fetching in restricted runtimes.
  */
+
+import * as https from "https";
+import * as fs from "fs";
+import * as path from "path";
+import * as os from "os";
 
 // ---- Types ----
 
@@ -37,28 +42,30 @@ const KNOWN_MODEL_VARS: Record<string, string> = {
   FREEBUFF_GLM_V52_MODEL_ID: "z-ai/glm-5.2",
 };
 
-const KNOWN_MODEL_SETS: Record<string, string[]> = {
-  FREEBUFF_ALLOWED_MODEL_IDS: [
-    "deepseek/deepseek-v4-pro",
-    "deepseek/deepseek-v4-flash",
-    "moonshotai/kimi-k2.6",
-    "minimax/minimax-m2.7",
-    "minimax/minimax-m3",
-    "mimo/mimo-v2.5",
-    "mimo/mimo-v2.5-pro",
-    "z-ai/glm-5.2",
-  ],
-};
+// ---- Fetch via Node https ----
+
+function httpsGet(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { timeout: 15_000 }, (res) => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        httpsGet(res.headers.location).then(resolve, reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      let data = "";
+      res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+      res.on("end", () => resolve(data));
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+  });
+}
 
 // ---- Parsing ----
-
-function resolveVar(value: string): string | null {
-  // Check KNOWN_MODEL_VARS
-  if (KNOWN_MODEL_VARS[value]) return KNOWN_MODEL_VARS[value];
-  // Check KNOWN_MODEL_SETS
-  if (KNOWN_MODEL_SETS[value]) return null; // sets don't resolve to single values
-  return null;
-}
 
 function extractModelsFromSource(source: string): string[] {
   const models = new Set<string>();
@@ -83,13 +90,11 @@ function extractModelsFromSource(source: string): string[] {
   const refRe = /'([^']+)':\s*new\s+Set\((\w+)\)/g;
   while ((match = refRe.exec(source)) !== null) {
     const varName = match[2];
-    const knownModels = KNOWN_MODEL_SETS[varName];
-    if (knownModels) knownModels.forEach((m) => models.add(m));
     const modelId = KNOWN_MODEL_VARS[varName];
     if (modelId) models.add(modelId);
   }
 
-  // Pattern 3: [VARIABLE]: 'agent-id' — reverse mapping in FREEBUFF_ROOT_AGENT_ID_BY_MODEL
+  // Pattern 3: [VARIABLE]: 'agent-id'
   const reverseRe = /\[([A-Z_]+)\]:\s*'([^']+)'/g;
   while ((match = reverseRe.exec(source)) !== null) {
     const varName = match[1];
@@ -97,7 +102,7 @@ function extractModelsFromSource(source: string): string[] {
     if (modelId) models.add(modelId);
   }
 
-  // Pattern 4: id: VARIABLE — in FREEBUFF_MODELS array
+  // Pattern 4: id: VARIABLE
   const idRe = /id:\s*([A-Z_]+)/g;
   while ((match = idRe.exec(source)) !== null) {
     const varName = match[1];
@@ -108,14 +113,44 @@ function extractModelsFromSource(source: string): string[] {
   return [...models].sort();
 }
 
-// ---- Catalog cache ----
+// ---- Disk cache (persists across restarts) ----
+
+interface DiskCache {
+  models: string[];
+  fetchedAt: number;
+}
+
+const DISK_CACHE_TTL_MS = 6 * 3600_000;
+
+function getDiskCachePath(): string {
+  return path.join(os.homedir(), ".config", "opencode-freebuff-auth", "models.json");
+}
+
+function loadDiskCache(): DiskCache | null {
+  try {
+    const p = getDiskCachePath();
+    if (!fs.existsSync(p)) return null;
+    const data = JSON.parse(fs.readFileSync(p, "utf8")) as DiskCache;
+    if (Date.now() - data.fetchedAt < DISK_CACHE_TTL_MS && data.models.length > 0) return data;
+  } catch {}
+  return null;
+}
+
+function saveDiskCache(models: string[]): void {
+  try {
+    const dir = path.dirname(getDiskCachePath());
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(getDiskCachePath(), JSON.stringify({ models, fetchedAt: Date.now() }), { mode: 0o600 });
+  } catch {}
+}
+
+// ---- Memory cache ----
 
 interface CacheEntry {
   byUid: Map<string, ModelCatalogEntry>;
   fetchedAt: number;
 }
 
-const CATALOG_TTL_MS = 6 * 3600_000;
 let cached: CacheEntry | null = null;
 
 function modelToEntry(modelUid: string): ModelCatalogEntry {
@@ -133,34 +168,40 @@ function modelToEntry(modelUid: string): ModelCatalogEntry {
   };
 }
 
+function buildCache(modelIds: string[]): CacheEntry {
+  const byUid = new Map<string, ModelCatalogEntry>();
+  for (const id of modelIds) byUid.set(id, modelToEntry(id));
+  return { byUid, fetchedAt: Date.now() };
+}
+
 // ---- Catalog API ----
 
 export async function getCachedCatalog(
-  apiKey: string,
+  _apiKey: string,
   signal?: AbortSignal,
 ): Promise<CacheEntry | null> {
-  const now = Date.now();
-  if (cached && now - cached.fetchedAt < CATALOG_TTL_MS) return cached;
+  // 1. Memory cache
+  if (cached) return cached;
 
+  // 2. Disk cache
+  const disk = loadDiskCache();
+  if (disk) {
+    cached = buildCache(disk.models);
+    console.error(`[freebuff] catalog: loaded ${disk.models.length} models from disk cache`);
+    return cached;
+  }
+
+  // 3. Fetch from source
   try {
     console.error("[freebuff] catalog: fetching from source...");
-    const response = await fetch(FREE_AGENTS_SOURCE_URL, {
-      signal: signal ?? AbortSignal.timeout(30_000),
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
-
-    if (response.ok) {
-      const source = await response.text();
-      const modelIds = extractModelsFromSource(source);
-      if (modelIds.length > 0) {
-        const byUid = new Map<string, ModelCatalogEntry>();
-        for (const id of modelIds) byUid.set(id, modelToEntry(id));
-        cached = { byUid, fetchedAt: now };
-        console.error(`[freebuff] catalog: fetched ${modelIds.length} models: ${modelIds.join(", ")}`);
-        return cached;
-      }
+    const source = await httpsGet(FREE_AGENTS_SOURCE_URL);
+    const modelIds = extractModelsFromSource(source);
+    if (modelIds.length > 0) {
+      cached = buildCache(modelIds);
+      saveDiskCache(modelIds);
+      console.error(`[freebuff] catalog: fetched ${modelIds.length} models: ${modelIds.join(", ")}`);
+      return cached;
     }
-    console.error(`[freebuff] catalog: HTTP ${response.status}`);
   } catch (e) {
     console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -168,8 +209,15 @@ export async function getCachedCatalog(
   return null;
 }
 
-export function clearCachedCatalog(): void { cached = null; }
-export function getCatalogEntry(modelUid: string): ModelCatalogEntry | undefined { return cached?.byUid.get(modelUid); }
+export function clearCachedCatalog(): void {
+  cached = null;
+  try { fs.unlinkSync(getDiskCachePath()); } catch {}
+}
+
+export function getCatalogEntry(modelUid: string): ModelCatalogEntry | undefined {
+  return cached?.byUid.get(modelUid);
+}
+
 export function getAllModels(): ModelCatalogEntry[] {
   if (cached) return [...cached.byUid.values()];
   return [];
