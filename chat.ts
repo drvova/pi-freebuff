@@ -10,6 +10,7 @@
  *
  * Sessions are cached and reused to avoid 429 rate limits.
  * The Buffy system prompt and freebuff_instance_id are required by the API.
+ * reasoning_content from thinking models is captured and re-injected on follow-up turns.
  */
 
 import * as crypto from "crypto";
@@ -88,20 +89,15 @@ function contentToText(content: ChatMessage["content"]): string {
   }).join("");
 }
 
-// Pass reasoning_content through from assistant messages (required by thinking models)
-function buildMessage(m: ChatMessage): Record<string, unknown> {
-  const msg: Record<string, unknown> = {
-    role: m.role === "developer" ? "system" : m.role,
-    content: contentToText(m.content),
-  };
-  if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
-  if (m.tool_calls) msg.tool_calls = m.tool_calls;
-  // Preserve reasoning_content if present (thinking models like deepseek require this)
-  const raw = m as Record<string, unknown>;
-  if (raw.reasoning_content && m.role === "assistant") {
-    msg.reasoning_content = raw.reasoning_content;
-  }
-  return msg;
+// ---- Reasoning content cache ----
+// Thinking models (deepseek, etc.) return reasoning_content which MUST be passed back
+// on subsequent turns. Pi doesn't store this, so we cache it per content hash.
+
+const reasoningCache = new Map<string, string>();
+const MAX_REASONING_CACHE = 50;
+
+function contentHash(text: string): string {
+  return crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
 // ---- HTTP helpers ----
@@ -204,6 +200,30 @@ async function finishRun(authToken: string, runId: string): Promise<void> {
   }
 }
 
+// ---- Message builder ----
+// Maps 'developer' → 'system', injects cached reasoning_content for thinking models
+
+function buildMessage(m: ChatMessage): Record<string, unknown> {
+  const msg: Record<string, unknown> = {
+    role: m.role === "developer" ? "system" : m.role,
+    content: contentToText(m.content),
+  };
+  if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+  if (m.tool_calls) msg.tool_calls = m.tool_calls;
+
+  // For assistant messages, inject cached reasoning_content if available
+  if (m.role === "assistant") {
+    const text = contentToText(m.content);
+    const hash = contentHash(text);
+    const cached = reasoningCache.get(hash);
+    if (cached) {
+      msg.reasoning_content = cached;
+    }
+  }
+
+  return msg;
+}
+
 // ---- Main streaming function ----
 
 export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
@@ -216,7 +236,6 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   const runId = await startRun(req.apiKey, agentId);
 
   // 3. Build messages with Buffy system prompt prepended
-  // Map 'developer' → 'system' (Codebuff only supports system/user/assistant/tool)
   const messages = [
     { role: "system" as const, content: BUFFY_SYSTEM_PROMPT },
     ...req.messages.map(buildMessage),
@@ -266,11 +285,24 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = "";
   let finished = false;
+  let contentText = "";
+  let reasoningText = "";
   const toolCallAccum: Map<number, { id: string; name: string; args: string }> = new Map();
 
   const finish = (reason: string) => {
     if (finished) return;
     finished = true;
+
+    // Cache reasoning_content for this response so it can be passed back on next turn
+    if (reasoningText && contentText) {
+      const hash = contentHash(contentText);
+      reasoningCache.set(hash, reasoningText);
+      if (reasoningCache.size > MAX_REASONING_CACHE) {
+        const firstKey = reasoningCache.keys().next().value;
+        if (firstKey) reasoningCache.delete(firstKey);
+      }
+    }
+
     for (const [, tc] of toolCallAccum) {
       if (tc.name && tc.args) {
         try { req.callbacks.onToolCall?.(tc.name, JSON.parse(tc.args)); } catch {}
@@ -299,7 +331,14 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
           const choice = parsed.choices?.[0];
           if (!choice) continue;
           const delta = choice.delta;
-          if (delta?.content) req.callbacks.onText?.(delta.content);
+          if (delta?.content) {
+            contentText += delta.content;
+            req.callbacks.onText?.(delta.content);
+          }
+          if (delta?.reasoning_content) {
+            reasoningText += delta.reasoning_content;
+            req.callbacks.onThinking?.(delta.reasoning_content);
+          }
 
           if (delta?.tool_calls) {
             for (const tc of delta.tool_calls) {
@@ -324,4 +363,7 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   }
 }
 
-export function clearSessionIds(): void { sessionCache.clear(); }
+export function clearSessionIds(): void {
+  sessionCache.clear();
+  reasoningCache.clear();
+}
