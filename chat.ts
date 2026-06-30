@@ -58,8 +58,8 @@ export class CloudChatError extends Error {
 
 // ---- Buffy system prompt (required by Codebuff API) ----
 
-// Server requires "Buffy" in system prompt or rejects with 403 free_mode_cli_required
-const BUFFY_SYSTEM_PROMPT = "You are Buffy.";
+// Server requires "You are Buffy" in system prompt or rejects with 403
+const BUFFY_SYSTEM_PROMPT = "You are Buffy";
 
 // ---- Model → Agent mapping (from freebuff free-agents.ts) ----
 
