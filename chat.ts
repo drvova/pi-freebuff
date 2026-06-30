@@ -238,12 +238,12 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   // 3. Build messages with Buffy system prompt prepended
   const messages = [
     { role: "system" as const, content: BUFFY_SYSTEM_PROMPT },
-    ...req.messages.map(buildMessage),
+    ...req.messages.filter(Boolean).map(buildMessage),
   ];
 
   const body: Record<string, unknown> = {
     model: sessionModel,
-    messages,
+    messages: messages.filter(Boolean),
     stream: true,
     codebuff_metadata: {
       run_id: runId,
@@ -252,7 +252,7 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
       freebuff_instance_id: instanceId,
     },
   };
-  if (req.tools && req.tools.length > 0) body.tools = req.tools;
+  if (req.tools && req.tools.length > 0) body.tools = req.tools.filter(Boolean);
   if (req.completionOpts?.maxOutputTokens) body.max_tokens = req.completionOpts.maxOutputTokens;
   if (req.completionOpts?.temperature !== undefined) body.temperature = req.completionOpts.temperature;
 
