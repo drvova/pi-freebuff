@@ -1,10 +1,13 @@
 /**
- * Dynamic model catalog for Freebuff.
- * Fetches live model list from Codebuff's free-agents.ts source file.
- * Uses Node https module for reliable fetching in restricted runtimes.
+ * Model catalog for Freebuff.
+ * Fetches live from Codebuff's open-source freebuff-models.ts:
+ * https://github.com/CodebuffAI/codebuff/blob/main/common/src/constants/freebuff-models.ts
+ *
+ * Uses curl via child_process — Node's https module times out in the Pi runtime,
+ * but curl (system binary, different TLS/DNS stack) works fine.
  */
 
-import * as https from "https";
+import { execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -42,27 +45,10 @@ const KNOWN_MODEL_VARS: Record<string, string> = {
   FREEBUFF_GLM_V52_MODEL_ID: "z-ai/glm-5.2",
 };
 
-// ---- Fetch via Node https ----
+// ---- Fetch via curl ----
 
-function httpsGet(url: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { timeout: 15_000 }, (res) => {
-      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        httpsGet(res.headers.location).then(resolve, reject);
-        return;
-      }
-      if (res.statusCode !== 200) {
-        reject(new Error(`HTTP ${res.statusCode}`));
-        return;
-      }
-      let data = "";
-      res.on("data", (chunk: Buffer) => { data += chunk.toString(); });
-      res.on("end", () => resolve(data));
-      res.on("error", reject);
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-  });
+function curlGet(url: string): string {
+  return execSync(`curl -sL --max-time 15 '${url}'`, { encoding: "utf8", timeout: 20_000 });
 }
 
 // ---- Parsing ----
@@ -91,8 +77,7 @@ function extractModelsFromSource(source: string): string[] {
   // Pattern 3: [VARIABLE]: 'agent-id'
   const reverseRe = /\[([A-Z_]+)\]:\s*'([^']+)'/g;
   while ((match = reverseRe.exec(source)) !== null) {
-    const varName = match[1];
-    const modelId = KNOWN_MODEL_VARS[varName];
+    const modelId = KNOWN_MODEL_VARS[match[1]];
     if (modelId) models.add(modelId);
   }
 
@@ -155,7 +140,7 @@ interface CacheEntry {
 let cached: CacheEntry | null = null;
 
 function modelToEntry(modelUid: string): ModelCatalogEntry {
-  const provider = modelUid.includes("/") ? modelUid.split("/")[0] : "unknown";
+  const provider = modelUid.split("/")[0];
   const label = modelUid.split("/").pop() ?? modelUid;
   return {
     modelUid,
@@ -179,7 +164,7 @@ function buildCache(modelIds: string[]): CacheEntry {
 
 export async function getCachedCatalog(
   _apiKey: string,
-  signal?: AbortSignal,
+  _signal?: AbortSignal,
 ): Promise<CacheEntry | null> {
   // 1. Memory cache
   if (cached) return cached;
@@ -192,10 +177,10 @@ export async function getCachedCatalog(
     return cached;
   }
 
-  // 3. Fetch from source
+  // 3. Fetch from source via curl
   try {
-    console.error("[freebuff] catalog: fetching from source...");
-    const source = await httpsGet(FREE_MODELS_SOURCE_URL);
+    console.error("[freebuff] catalog: fetching from source via curl...");
+    const source = curlGet(FREE_MODELS_SOURCE_URL);
     const modelIds = extractModelsFromSource(source);
     if (modelIds.length > 0) {
       cached = buildCache(modelIds);
@@ -203,6 +188,7 @@ export async function getCachedCatalog(
       console.error(`[freebuff] catalog: fetched ${modelIds.length} models: ${modelIds.join(", ")}`);
       return cached;
     }
+    console.error("[freebuff] catalog: no models parsed from source");
   } catch (e) {
     console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
