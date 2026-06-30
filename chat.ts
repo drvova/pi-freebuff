@@ -198,10 +198,11 @@ export async function streamCloudChat(req: CloudChatRequest): Promise<void> {
   const runId = await startRun(req.apiKey, agentId);
 
   // 3. Build messages with Buffy system prompt prepended
+  // Map 'developer' → 'system' (Codebuff only supports system/user/assistant/tool)
   const messages = [
     { role: "system" as const, content: BUFFY_SYSTEM_PROMPT },
     ...req.messages.map((m) => ({
-      role: m.role,
+      role: m.role === "developer" ? ("system" as const) : m.role,
       content: contentToText(m.content),
       ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
       ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
