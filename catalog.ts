@@ -1,17 +1,10 @@
 /**
  * Dynamic model catalog for Freebuff.
- * Fetches live model list from the backend REST API.
+ * Fetches live model list from Codebuff's free-agents.ts source file.
+ * Falls back to hardcoded list if fetch fails.
  */
 
-import { DEFAULT_REGION } from "./oauth";
-
 // ---- Types ----
-
-export interface ModelFeatures {
-  supportsThinking?: boolean;
-  supportsToolCalls?: boolean;
-  supportsImageCaptions?: boolean;
-}
 
 export interface ModelCatalogEntry {
   modelUid: string;
@@ -19,10 +12,76 @@ export interface ModelCatalogEntry {
   provider: string;
   contextWindow: number;
   maxOutputTokens: number;
-  features?: ModelFeatures;
+  features?: { supportsThinking?: boolean; supportsToolCalls?: boolean; supportsImageCaptions?: boolean };
   isFree: boolean;
   isThinking: boolean;
   disabled?: boolean;
+}
+
+// ---- Source URL ----
+
+const FREE_AGENTS_SOURCE_URL =
+  "https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/free-agents.ts";
+
+// ---- Known model variable mappings (from free-agents.ts) ----
+
+const KNOWN_MODEL_VARS: Record<string, string> = {
+  FREEBUFF_DEEPSEEK_V4_PRO_MODEL_ID: "deepseek/deepseek-v4-pro",
+  FREEBUFF_DEEPSEEK_V4_FLASH_MODEL_ID: "deepseek/deepseek-v4-flash",
+  FREEBUFF_GEMINI_PRO_MODEL_ID: "google/gemini-3.1-pro-preview",
+  FREEBUFF_KIMI_MODEL_ID: "moonshotai/kimi-k2.6",
+  FREEBUFF_MINIMAX_MODEL_ID: "minimax/minimax-m2.7",
+  FREEBUFF_MINIMAX_M3_MODEL_ID: "minimax/minimax-m3",
+  FREEBUFF_MIMO_V25_MODEL_ID: "mimo/mimo-v2.5",
+  FREEBUFF_MIMO_V25_PRO_MODEL_ID: "mimo/mimo-v2.5-pro",
+};
+
+const KNOWN_MODEL_SETS: Record<string, string[]> = {
+  FREEBUFF_ALLOWED_MODEL_IDS: [
+    "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-flash",
+    "moonshotai/kimi-k2.6",
+    "minimax/minimax-m2.7",
+    "minimax/minimax-m3",
+    "mimo/mimo-v2.5",
+    "mimo/mimo-v2.5-pro",
+  ],
+};
+
+// ---- Parsing ----
+
+function extractModelsFromSource(source: string): string[] {
+  const models = new Set<string>();
+
+  // Pattern 1: 'model-id': new Set([...])
+  const literalRe = /'([^']+)':\s*new\s+Set\(\[([^\]]*)\]\)/g;
+  let match: RegExpExecArray | null;
+  while ((match = literalRe.exec(source)) !== null) {
+    const inner = match[2];
+    const modelRe = /'([^']+)'/g;
+    let m: RegExpExecArray | null;
+    while ((m = modelRe.exec(inner)) !== null) {
+      const model = m[1].trim();
+      if (model) models.add(model);
+    }
+    // Resolve known variable references
+    for (const [varName, modelId] of Object.entries(KNOWN_MODEL_VARS)) {
+      if (inner.includes(varName)) models.add(modelId);
+    }
+  }
+
+  // Pattern 2: 'agent-id': new Set(VARIABLE_NAME)
+  const refRe = /'([^']+)':\s*new\s+Set\((\w+)\)/g;
+  while ((match = refRe.exec(source)) !== null) {
+    const varName = match[2];
+    const knownModels = KNOWN_MODEL_SETS[varName];
+    if (knownModels) knownModels.forEach((m) => models.add(m));
+    // Also check variable mappings
+    const modelId = KNOWN_MODEL_VARS[varName];
+    if (modelId) models.add(modelId);
+  }
+
+  return [...models].sort();
 }
 
 // ---- Catalog cache ----
@@ -32,23 +91,22 @@ interface CacheEntry {
   fetchedAt: number;
 }
 
-const CATALOG_TTL_MS = 10 * 60 * 1000;
+const CATALOG_TTL_MS = 6 * 3600_000; // 6 hours (same as freebuff-proxy)
 let cached: CacheEntry | null = null;
 
-// ---- Fallback catalog ----
-
-function getFallbackCatalog(): ModelCatalogEntry[] {
-  return [
-    { modelUid: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro", provider: "deepseek", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-    { modelUid: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash", provider: "deepseek", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-    { modelUid: "minimax/minimax-m2.7", label: "MiniMax M2.7", provider: "minimax", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-    { modelUid: "minimax/minimax-m3", label: "MiniMax M3", provider: "minimax", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-    { modelUid: "mimo/mimo-v2.5", label: "MiMo V2.5", provider: "mimo", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-    { modelUid: "mimo/mimo-v2.5-pro", label: "MiMo V2.5 Pro", provider: "mimo", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-    { modelUid: "moonshotai/kimi-k2.6", label: "Kimi K2.6", provider: "moonshotai", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-    { modelUid: "z-ai/glm-5.1", label: "GLM-5.1", provider: "z-ai", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-    { modelUid: "z-ai/glm-5.2", label: "GLM-5.2", provider: "z-ai", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
-  ];
+function modelToEntry(modelUid: string): ModelCatalogEntry {
+  const provider = modelUid.includes("/") ? modelUid.split("/")[0] : "unknown";
+  const label = modelUid.split("/").pop() ?? modelUid;
+  return {
+    modelUid,
+    label,
+    provider,
+    contextWindow: 195_000,
+    maxOutputTokens: 60_000,
+    features: { supportsThinking: true, supportsToolCalls: true, supportsImageCaptions: true },
+    isFree: true,
+    isThinking: true,
+  };
 }
 
 // ---- Catalog API ----
@@ -61,43 +119,37 @@ export async function getCachedCatalog(
   if (cached && now - cached.fetchedAt < CATALOG_TTL_MS) return cached;
 
   try {
-    const response = await fetch(`${DEFAULT_REGION.api}/api/v1/models`, {
-      headers: { "Authorization": `Bearer ${apiKey}`, "User-Agent": "Bun/1.3.11" },
-      signal: signal ?? AbortSignal.timeout(10_000),
+    const response = await fetch(FREE_AGENTS_SOURCE_URL, {
+      signal: signal ?? AbortSignal.timeout(15_000),
     });
 
     if (response.ok) {
-      const data = await response.json() as { data?: Array<{ id: string; [key: string]: unknown }> };
-      const models = new Map<string, ModelCatalogEntry>();
-      const list = data.data ?? [];
-      for (const m of list) {
-        if (m.id) {
-          models.set(m.id, {
-            modelUid: m.id,
-            label: String(m.id.split("/").pop() ?? m.id),
-            provider: m.id.includes("/") ? m.id.split("/")[0] : "unknown",
-            contextWindow: typeof m.context_window === "number" ? m.context_window : 195_000,
-            maxOutputTokens: typeof m.max_output_tokens === "number" ? m.max_output_tokens : 60_000,
-            isFree: true,
-            isThinking: true,
-          });
-        }
-      }
-      if (models.size > 0) {
-        cached = { byUid: models, fetchedAt: now };
+      const source = await response.text();
+      const modelIds = extractModelsFromSource(source);
+      if (modelIds.length > 0) {
+        const byUid = new Map<string, ModelCatalogEntry>();
+        for (const id of modelIds) byUid.set(id, modelToEntry(id));
+        cached = { byUid, fetchedAt: now };
+        console.error(`[freebuff] catalog: fetched ${modelIds.length} models from source`);
         return cached;
       }
     }
-  } catch {}
+  } catch (e) {
+    console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
 
-  // Fallback
-  const fallback = getFallbackCatalog();
+  // Fallback: use known models
+  const fallbackModels = Object.values(KNOWN_MODEL_VARS);
   const byUid = new Map<string, ModelCatalogEntry>();
-  for (const entry of fallback) byUid.set(entry.modelUid, entry);
+  for (const id of fallbackModels) byUid.set(id, modelToEntry(id));
   cached = { byUid, fetchedAt: now };
+  console.error(`[freebuff] catalog: using fallback ${fallbackModels.length} models`);
   return cached;
 }
 
 export function clearCachedCatalog(): void { cached = null; }
 export function getCatalogEntry(modelUid: string): ModelCatalogEntry | undefined { return cached?.byUid.get(modelUid); }
-export function getAllModels(): ModelCatalogEntry[] { return getFallbackCatalog(); }
+export function getAllModels(): ModelCatalogEntry[] {
+  const fallbackModels = Object.values(KNOWN_MODEL_VARS);
+  return fallbackModels.map(modelToEntry);
+}
