@@ -89,23 +89,22 @@ export function deleteCredentials(): boolean {
 // platform, then hashes it with SHA-256 for the status poll.
 // ----------------------------------------------------------------------------
 
-function getFingerprintString(): string {
-  const hostname = os.hostname();
-  const username = os.userInfo().username;
-  const platform = os.platform();
-  return `${hostname}:${username}:${platform}`;
+function getFingerprintInfo(): Record<string, string> {
+  return {
+    hostname: os.hostname(),
+    username: os.userInfo().username,
+    platform: os.platform(),
+    arch: os.arch(),
+  };
 }
 
 function getFingerprintId(): string {
-  const fp = getFingerprintString();
-  const hash = crypto.createHash("sha256").update(fp).digest();
+  const info = getFingerprintInfo();
+  const fingerprintString = JSON.stringify(info);
+  const hash = crypto.createHash("sha256").update(fingerprintString).digest();
   const base64 = hash.toString("base64url");
   const suffix = crypto.randomBytes(6).toString("base64url").substring(0, 8);
   return `${base64}-${suffix}`;
-}
-
-function getFingerprintHash(fingerprintString: string): string {
-  return crypto.createHash("sha256").update(fingerprintString).digest().toString("base64url");
 }
 
 // ----------------------------------------------------------------------------
@@ -170,13 +169,39 @@ export async function runLoginLoopback(
     try {
       const statusRes = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
 
+      // Check Set-Cookie headers for session token
+      const setCookies = statusRes.headers.getSetCookie?.() ?? [];
+      for (const cookie of setCookies) {
+        const match = cookie.match(/next-auth\.session-token=([^;]+)/);
+        const secureMatch = cookie.match(/__Secure-next-auth\.session-token=([^;]+)/);
+        const token = match?.[1] ?? secureMatch?.[1];
+        if (token) {
+          console.error("[freebuff] sign-in complete (from cookie)!");
+          return token;
+        }
+      }
+
       if (statusRes.ok) {
         const statusData = await statusRes.json() as Record<string, unknown>;
+        
+        // Binary returns { user: { id, email, name, authToken, ... }, message }
+        const user = statusData.user as Record<string, unknown> | undefined;
+        if (user) {
+          const token = user.authToken
+            ?? user.token
+            ?? user.session_token
+            ?? user.access_token;
+          if (typeof token === "string" && token) {
+            console.error("[freebuff] sign-in complete!");
+            return token;
+          }
+        }
+        
+        // Fallback: top-level token fields
         const token = statusData.token
           ?? statusData.authToken
           ?? statusData.session_token
           ?? statusData.access_token;
-
         if (typeof token === "string" && token) {
           console.error("[freebuff] sign-in complete!");
           return token;
