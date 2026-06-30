@@ -1,0 +1,33 @@
+{
+  "name": "pi-freebuff",
+  "version": "0.1.0",
+  "description": "Freebuff/Codebuff models in Pi — DeepSeek, Kimi, MiniMax via your Freebuff subscription",
+  "author": "drvova",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "freebuff",
+    "codebuff",
+    "ai",
+    "llm",
+    "provider"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drvova/pi-freebuff.git"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "*.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "@types/node": "^26.0.1"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "lockfileVersion": 0,
+  "packages": {
+    "@types/node": {
+      "version": "26.0.1"
+    }
+  }
+}
