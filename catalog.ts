@@ -47,6 +47,7 @@ function getFallbackCatalog(): ModelCatalogEntry[] {
     { modelUid: "mimo/mimo-v2.5-pro", label: "MiMo V2.5 Pro", provider: "mimo", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
     { modelUid: "moonshotai/kimi-k2.6", label: "Kimi K2.6", provider: "moonshotai", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
     { modelUid: "z-ai/glm-5.1", label: "GLM-5.1", provider: "z-ai", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
+    { modelUid: "z-ai/glm-5.2", label: "GLM-5.2", provider: "z-ai", contextWindow: 195_000, maxOutputTokens: 60_000, features: { supportsThinking: true, supportsToolCalls: true }, isFree: true, isThinking: true },
   ];
 }
 
