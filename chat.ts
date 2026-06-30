@@ -530,3 +530,15 @@ export async function submitToolResult(
     try { conn.ws.send(requestJson); } catch (err) { clearTimeout(timer); finish(err); }
   });
 }
+
+// --------------------------------------------------------------------------
+// Session management
+// --------------------------------------------------------------------------
+
+/** Clear all pooled WebSocket connections (called on logout). */
+export function clearSessionIds(): void {
+  if (pooled) {
+    try { pooled.ws.close(); } catch {}
+    pooled = null;
+  }
+}

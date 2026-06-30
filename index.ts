@@ -107,16 +107,15 @@ export default async function (pi: ExtensionAPI) {
     }
   } catch {}
 
-  // Build models dynamically from catalog
-  const models = hasCreds ? await buildDynamicModels(apiKey, backendUrl) : getAllModels().map(catalogModelToPi);
-
+  // Register immediately with fallback models — fetch catalog async in background
+  const fallbackModels = getAllModels().map(catalogModelToPi);
   pi.registerProvider("freebuff", {
     name: "Freebuff (Codebuff)",
     baseUrl,
     apiKey: PROXY_SECRET,
     api: "openai-completions",
     authHeader: true,
-    models,
+    models: fallbackModels,
     oauth: {
       name: "Freebuff (Codebuff)",
       login: loginFreebuff,
@@ -125,7 +124,18 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  console.error(hasCreds ? `[freebuff] connected — ${models.length} models` : `[freebuff] /freebuff-login to connect`);
+  // Fetch live catalog in background (non-blocking)
+  if (hasCreds) {
+    buildDynamicModels(apiKey, backendUrl).then((liveModels) => {
+      if (liveModels.length > 0) {
+        console.error(`[freebuff] catalog fetched: ${liveModels.length} models (restart to use)`);
+      }
+    }).catch((e) => {
+      console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }
+
+  console.error(hasCreds ? `[freebuff] connected — ${fallbackModels.length} models (live catalog loading in background)` : `[freebuff] /freebuff-login to connect`);
 
   pi.registerCommand("freebuff-status", {
     description: "Show Freebuff auth status",
