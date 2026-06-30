@@ -1,14 +1,13 @@
 /**
  * OAuth login + credential storage for Freebuff/Codebuff.
  *
- * Codebuff uses NextAuth (GitHub/Google OAuth).
- * Auth flow:
- *   1. Open browser to codebuff sign-in
- *   2. User signs in via GitHub/Google
- *   3. Capture session token from callback redirect
+ * Codebuff CLI auth flow:
+ *   1. POST /api/auth/cli/code { fingerprintId, referralCode } → device code + URL
+ *   2. Open browser to verification URL
+ *   3. Poll GET /api/auth/cli/status?fingerprintId=...&fingerprintHash=...&expiresAt=...
+ *   4. Receive authToken → use as next-auth.session-token cookie
  */
 
-import * as http from "http";
 import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
@@ -38,6 +37,8 @@ export const DEFAULT_REGION: FreebuffRegion = {
 
 export interface PersistedCredentials extends OAuthLoginResult {
   issuedAt: string;
+  fingerprintId: string;
+  fingerprintHash: string;
 }
 
 // ----------------------------------------------------------------------------
@@ -82,167 +83,121 @@ export function deleteCredentials(): boolean {
 }
 
 // ----------------------------------------------------------------------------
-// Auth flow — loopback callback server
+// Device fingerprint
 //
-// 1. Start local HTTP server on random port
-// 2. Open browser to codebuff sign-in with callbackUrl=http://127.0.0.1:PORT
-// 3. User signs in via GitHub/Google on codebuff.com
-// 4. NextAuth redirects to callbackUrl with session cookie
-// 5. We capture the cookie and extract the token
+// Codebuff generates a unique device fingerprint from hostname + username +
+// platform, then hashes it with SHA-256 for the status poll.
 // ----------------------------------------------------------------------------
+
+function getFingerprintString(): string {
+  const hostname = os.hostname();
+  const username = os.userInfo().username;
+  const platform = os.platform();
+  return `${hostname}:${username}:${platform}`;
+}
+
+function getFingerprintId(): string {
+  const fp = getFingerprintString();
+  const hash = crypto.createHash("sha256").update(fp).digest();
+  const base64 = hash.toString("base64url");
+  const suffix = crypto.randomBytes(6).toString("base64url").substring(0, 8);
+  return `${base64}-${suffix}`;
+}
+
+function getFingerprintHash(fingerprintString: string): string {
+  return crypto.createHash("sha256").update(fingerprintString).digest().toString("base64url");
+}
+
+// ----------------------------------------------------------------------------
+// Device code flow
+// ----------------------------------------------------------------------------
+
+interface DeviceCodeResponse {
+  device_code?: string;
+  user_code?: string;
+  verification_url?: string;
+  verificationUri?: string;
+  verification_uri_complete?: string;
+  expires_in?: number;
+  interval?: number;
+  url?: string;
+  code?: string;
+}
 
 export async function runLoginLoopback(
   region: FreebuffRegion,
   onUrl: (url: string) => void,
   signal?: AbortSignal,
 ): Promise<string> {
-  const server = await startCallbackServer();
-  const callbackUrl = `http://127.0.0.1:${server.port}/callback`;
-  const loginUrl = `${region.website}/auth/signin?callbackUrl=${encodeURIComponent(callbackUrl)}`;
+  const fingerprintId = getFingerprintId();
+  const fingerprintString = getFingerprintString();
+  const fingerprintHash = getFingerprintHash(fingerprintString);
 
-  const callbackPromise = server.waitForToken(signal);
-
-  onUrl(loginUrl);
-  await openBrowser(loginUrl).catch(() => {});
-
-  const token = await withTimeout(callbackPromise, 5 * 60 * 1000, "Sign-in timed out (5 min).");
-  server.close();
-
-  if (!token) throw new Error("No session token received.");
-  return token;
-}
-
-// ----------------------------------------------------------------------------
-// Callback server — captures session cookie from NextAuth redirect
-// ----------------------------------------------------------------------------
-
-interface CallbackServer {
-  port: number;
-  close: () => void;
-  waitForToken: (signal?: AbortSignal) => Promise<string>;
-}
-
-function startCallbackServer(): Promise<CallbackServer> {
-  return new Promise((resolve, reject) => {
-    let tokenResolve: ((token: string) => void) | null = null;
-    let tokenReject: ((err: Error) => void) | null = null;
-
-    const server = http.createServer((req, res) => {
-      const url = new URL(req.url ?? "/", "http://127.0.0.1");
-
-      // Extract session cookie from request headers
-      const cookies = req.headers.cookie ?? "";
-      const sessionMatch = cookies.match(/next-auth\.session-token=([^;]+)/);
-      const secureSessionMatch = cookies.match(/__Secure-next-auth\.session-token=([^;]+)/);
-      const token = sessionMatch?.[1] ?? secureSessionMatch?.[1];
-
-      if (token) {
-        // Success — send response and resolve
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("<html><body><h1>Signed in to Codebuff!</h1><p>You can close this tab.</p></body></html>");
-        tokenResolve?.(token);
-        return;
-      }
-
-      // Also check URL params (some auth flows put token in URL)
-      const urlToken = url.searchParams.get("token")
-        ?? url.searchParams.get("authToken")
-        ?? url.searchParams.get("session_token");
-
-      if (urlToken) {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end("<html><body><h1>Signed in to Codebuff!</h1><p>You can close this tab.</p></body></html>");
-        tokenResolve?.(urlToken);
-        return;
-      }
-
-      // No token yet — might be a redirect or intermediate request
-      // Send a page that reads document.cookie and sends it back
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(`<!DOCTYPE html><html><body>
-<p>Waiting for sign-in...</p>
-<script>
-// If we're on the callback page with cookies, send them
-if (document.cookie) {
-  fetch("/callback?cookies=" + encodeURIComponent(document.cookie));
-}
-</script>
-</body></html>`);
-    });
-
-    server.on("error", reject);
-
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      if (!addr || typeof addr === "string") {
-        reject(new Error("Failed to bind callback server"));
-        return;
-      }
-
-      resolve({
-        port: addr.port,
-        close: () => { try { server.close(); } catch {} },
-        waitForToken: (signal?: AbortSignal) =>
-          new Promise<string>((res, rej) => {
-            tokenResolve = res;
-            tokenReject = rej;
-            signal?.addEventListener("abort", () => {
-              rej(new Error("Sign-in cancelled."));
-            }, { once: true });
-          }),
-      });
-    });
-  });
-}
-
-// Also try to get the token by polling the codebuff API with the session
-export async function exchangeSessionForApiKey(
-  sessionToken: string,
-  region: FreebuffRegion,
-): Promise<OAuthLoginResult> {
-  // Try the status endpoint with the session cookie
-  const response = await fetch(`${region.website}/api/auth/cli/status`, {
-    method: "GET",
-    headers: {
-      "Cookie": `next-auth.session-token=${sessionToken}`,
-      "Authorization": `Bearer ${sessionToken}`,
-    },
+  // Step 1: Request device code
+  console.error("[freebuff] requesting device code...");
+  const codeRes = await fetch(`${region.website}/api/auth/cli/code`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fingerprintId }),
     signal: AbortSignal.timeout(15_000),
   });
 
-  if (!response.ok) {
-    // If CLI status doesn't work, try using the session token directly as API key
-    // Many services accept the session token as a bearer token
-    return {
-      apiKey: sessionToken,
-      name: "freebuff-user",
-      apiServerUrl: region.website,
-      backendUrl: region.backendUrl,
-    };
+  if (!codeRes.ok) {
+    const text = await codeRes.text();
+    console.error(`[freebuff] device code request failed: ${codeRes.status} ${text.slice(0, 200)}`);
+    throw new Error(`Device code request failed: HTTP ${codeRes.status}`);
   }
 
-  const text = await response.text();
-  try {
-    const parsed = JSON.parse(text) as Record<string, unknown>;
-    const token = parsed.token
-      ?? parsed.authToken
-      ?? parsed.session_token
-      ?? parsed.access_token
-      ?? sessionToken;
-    return {
-      apiKey: String(token),
-      name: "freebuff-user",
-      apiServerUrl: region.website,
-      backendUrl: region.backendUrl,
-    };
-  } catch {
-    return {
-      apiKey: sessionToken,
-      name: "freebuff-user",
-      apiServerUrl: region.website,
-      backendUrl: region.backendUrl,
-    };
+  const codeData: DeviceCodeResponse = await codeRes.json();
+  console.error("[freebuff] device code response:", JSON.stringify(codeData).slice(0, 200));
+
+  const verificationUrl = codeData.verification_url
+    ?? codeData.verificationUri
+    ?? codeData.verification_uri_complete
+    ?? codeData.url
+    ?? `${region.website}/auth/cli?user_code=${codeData.user_code ?? codeData.code}`;
+
+  // Step 2: Open browser
+  onUrl(verificationUrl);
+  await openBrowser(verificationUrl).catch(() => {});
+
+  // Step 3: Poll for completion
+  const expiresAt = Date.now() + (codeData.expires_in ?? 300) * 1000;
+  const intervalSec = codeData.interval ?? 5;
+  const deadline = Date.now() + 10 * 60 * 1000;
+
+  console.error(`[freebuff] waiting for sign-in at: ${verificationUrl}`);
+  console.error(`[freebuff] polling every ${intervalSec}s...`);
+
+  while (Date.now() < deadline) {
+    if (signal?.aborted) throw new Error("Sign-in cancelled.");
+
+    await sleep(intervalSec * 1000);
+
+    const statusUrl = `${region.website}/api/auth/cli/status?fingerprintId=${encodeURIComponent(fingerprintId)}&fingerprintHash=${encodeURIComponent(fingerprintHash)}&expiresAt=${expiresAt}`;
+
+    try {
+      const statusRes = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
+
+      if (statusRes.ok) {
+        const statusData = await statusRes.json() as Record<string, unknown>;
+        const token = statusData.token
+          ?? statusData.authToken
+          ?? statusData.session_token
+          ?? statusData.access_token;
+
+        if (typeof token === "string" && token) {
+          console.error("[freebuff] sign-in complete!");
+          return token;
+        }
+      }
+    } catch (e) {
+      if (signal?.aborted) throw new Error("Sign-in cancelled.");
+      // Keep polling on transient errors
+    }
   }
+
+  throw new Error("Sign-in timed out (10 min). Please try again.");
 }
 
 // ----------------------------------------------------------------------------
@@ -268,15 +223,9 @@ async function openBrowser(url: string): Promise<void> {
 }
 
 // ----------------------------------------------------------------------------
-// Timeout helper
+// Helpers
 // ----------------------------------------------------------------------------
 
-function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(msg)), ms);
-    p.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); },
-    );
-  });
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }

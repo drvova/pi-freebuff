@@ -9,7 +9,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { startProxy, stopProxy, PROXY_SECRET, setProxyCredentials } from "./proxy";
-import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runLoginLoopback, exchangeSessionForApiKey, type PersistedCredentials } from "./oauth";
+import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runLoginLoopback, type PersistedCredentials } from "./oauth";
 import { clearCachedToken } from "./auth";
 import { clearSessionIds } from "./chat";
 import { getAllModels, getCachedCatalog, clearCachedCatalog, type ModelCatalogEntry } from "./catalog";
@@ -60,13 +60,24 @@ async function buildDynamicModels(apiKey: string, backendUrl: string): Promise<R
 
 // OAuth
 async function loginFreebuff(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  const sessionToken = await runLoginLoopback(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
-  const result = await exchangeSessionForApiKey(sessionToken, DEFAULT_REGION);
-  saveCredentials({ ...result, issuedAt: new Date().toISOString() });
-  setProxyCredentials({ apiKey: result.apiKey, backendUrl: result.backendUrl });
+  const token = await runLoginLoopback(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
+  if (!token) throw new Error("No token received.");
+
+  // Save credentials
+  const creds: PersistedCredentials = {
+    apiKey: token,
+    name: "freebuff-user",
+    apiServerUrl: DEFAULT_REGION.website,
+    backendUrl: DEFAULT_REGION.backendUrl,
+    issuedAt: new Date().toISOString(),
+    fingerprintId: "",
+    fingerprintHash: "",
+  };
+  saveCredentials(creds);
+  setProxyCredentials({ apiKey: token, backendUrl: DEFAULT_REGION.backendUrl });
   clearCachedToken();
   clearSessionIds();
-  return { refresh: result.apiKey, access: result.apiKey, expires: Date.now() + 365 * 24 * 60 * 60 * 1000 };
+  return { refresh: token, access: token, expires: Date.now() + 365 * 24 * 60 * 60 * 1000 };
 }
 
 async function refreshFreebuffToken(c: OAuthCredentials): Promise<OAuthCredentials> { return c; }
