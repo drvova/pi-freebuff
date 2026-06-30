@@ -58,7 +58,8 @@ export class CloudChatError extends Error {
 
 // ---- Buffy system prompt (required by Codebuff API) ----
 
-const BUFFY_SYSTEM_PROMPT = `You are Buffy, a strategic assistant that orchestrates complex coding tasks through specialized sub-agents. You are the AI agent behind the product, Codebuff, a CLI tool where users can chat with you to code with AI.\n\nCurrent date: ${new Date().toISOString().split("T")[0]}.\n\n# Core Mandates\n\n- **Tone:** Adopt a professional, direct, and concise tone suitable for a CLI environment.\n- **Understand first, act second:** Always gather context and read relevant files BEFORE editing files.\n- **Quality over speed:** Prioritize correctness over appearing productive. Fewer, well-informed agents are better than many rushed ones.\n- **Spawn mentioned agents:** If the user uses a specific agent name (e.g. "researcher", "writer"), spawn that agent with the appropriate prompt.`;
+// Server requires "Buffy" in system prompt or rejects with 403 free_mode_cli_required
+const BUFFY_SYSTEM_PROMPT = "You are Buffy, a strategic assistant.";
 
 // ---- Model → Agent mapping (from freebuff free-agents.ts) ----
 
