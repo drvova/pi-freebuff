@@ -1,11 +1,13 @@
 /**
- * OAuth login + credential storage for Freebuff/Codebuff.
+ * OAuth login + credential storage for Freebuff.
  *
- * Codebuff CLI auth flow:
- *   1. POST /api/auth/cli/code { fingerprintId, referralCode } → device code + URL
- *   2. Open browser to verification URL
- *   3. Poll GET /api/auth/cli/status?fingerprintId=...&fingerprintHash=...&expiresAt=...
- *   4. Receive authToken → use as next-auth.session-token cookie
+ * Auth flow (from freebuff-proxy reference):
+ *   1. Generate fingerprint: enhanced-{base64url(32 bytes)}
+ *   2. Hash: SHA-256(fingerprintId).hex()
+ *   3. POST https://freebuff.com/api/auth/cli/code { fingerprintId }
+ *   4. Open browser to loginUrl
+ *   5. Poll GET https://freebuff.com/api/auth/cli/status?fingerprintId=...&fingerprintHash=...&expiresAt=...
+ *   6. Receive { user: { authToken, ... }, message }
  */
 
 import * as crypto from "crypto";
@@ -14,45 +16,39 @@ import * as path from "path";
 import * as os from "os";
 import { spawn } from "child_process";
 
-// ----------------------------------------------------------------------------
-// Types
-// ----------------------------------------------------------------------------
+// ---- Types ----
 
-export interface OAuthLoginResult {
+export interface PersistedCredentials {
   apiKey: string;
   name: string;
+  email: string;
   apiServerUrl: string;
   backendUrl: string;
-}
-
-export interface FreebuffRegion {
-  website: string;
-  backendUrl: string;
-}
-
-export const DEFAULT_REGION: FreebuffRegion = {
-  website: "https://www.codebuff.com",
-  backendUrl: "https://manicode-backend.onrender.com",
-};
-
-export interface PersistedCredentials extends OAuthLoginResult {
   issuedAt: string;
   fingerprintId: string;
   fingerprintHash: string;
 }
 
-// ----------------------------------------------------------------------------
-// Credential Storage
-// ----------------------------------------------------------------------------
+export interface FreebuffRegion {
+  auth: string;
+  api: string;
+}
+
+export const DEFAULT_REGION: FreebuffRegion = {
+  auth: "https://freebuff.com",
+  api: "https://www.codebuff.com",
+};
+
+// ---- Credential storage ----
 
 const APP_DIR_NAME = "opencode-freebuff-auth";
 const CREDS_FILENAME = "credentials.json";
 
-export function getCredentialsDir(): string {
+function getCredentialsDir(): string {
   return path.join(os.homedir(), ".config", APP_DIR_NAME);
 }
 
-export function getCredentialsPath(): string {
+function getCredentialsPath(): string {
   return path.join(getCredentialsDir(), CREDS_FILENAME);
 }
 
@@ -63,11 +59,7 @@ function ensureDir(): void {
 export function loadCredentials(): PersistedCredentials | null {
   const p = getCredentialsPath();
   if (!fs.existsSync(p)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf8")) as PersistedCredentials;
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(fs.readFileSync(p, "utf8")) as PersistedCredentials; } catch { return null; }
 }
 
 export function saveCredentials(creds: PersistedCredentials): void {
@@ -82,34 +74,18 @@ export function deleteCredentials(): boolean {
   return true;
 }
 
-// ----------------------------------------------------------------------------
-// Device fingerprint
-//
-// Codebuff generates a unique device fingerprint from hostname + username +
-// platform, then hashes it with SHA-256 for the status poll.
-// ----------------------------------------------------------------------------
+// ---- Fingerprint ----
 
-function getFingerprintInfo(): Record<string, string> {
-  return {
-    hostname: os.hostname(),
-    username: os.userInfo().username,
-    platform: os.platform(),
-    arch: os.arch(),
-  };
+function generateFingerprintId(): string {
+  const buf = crypto.randomBytes(32);
+  return `enhanced-${buf.toString("base64url")}`;
 }
 
-function getFingerprintId(): string {
-  const info = getFingerprintInfo();
-  const fingerprintString = JSON.stringify(info);
-  const hash = crypto.createHash("sha256").update(fingerprintString).digest();
-  const base64 = hash.toString("base64url");
-  const suffix = crypto.randomBytes(6).toString("base64url").substring(0, 8);
-  return `${base64}-${suffix}`;
+function hashFingerprint(fingerprintId: string): string {
+  return crypto.createHash("sha256").update(fingerprintId).digest("hex");
 }
 
-// ----------------------------------------------------------------------------
-// Device code flow
-// ----------------------------------------------------------------------------
+// ---- Device code auth flow ----
 
 interface DeviceCodeResponse {
   fingerprintId: string;
@@ -122,100 +98,65 @@ export async function runLoginLoopback(
   region: FreebuffRegion,
   onUrl: (url: string) => void,
   signal?: AbortSignal,
-): Promise<string> {
-  const fingerprintId = getFingerprintId();
+): Promise<{ authToken: string; user: { id: string; name: string; email: string } }> {
+  const fingerprintId = generateFingerprintId();
 
   // Step 1: Request device code
   console.error("[freebuff] requesting device code...");
-  const codeRes = await fetch(`${region.website}/api/auth/cli/code`, {
+  const codeRes = await fetch(`${region.auth}/api/auth/cli/code`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "User-Agent": "Bun/1.3.11" },
     body: JSON.stringify({ fingerprintId }),
     signal: AbortSignal.timeout(15_000),
   });
 
   if (!codeRes.ok) {
     const text = await codeRes.text();
-    console.error(`[freebuff] device code request failed: ${codeRes.status} ${text.slice(0, 200)}`);
-    throw new Error(`Device code request failed: HTTP ${codeRes.status}`);
+    throw new Error(`Device code request failed: HTTP ${codeRes.status} ${text.slice(0, 200)}`);
   }
 
   const codeData: DeviceCodeResponse = await codeRes.json();
-  console.error("[freebuff] device code response:", JSON.stringify(codeData).slice(0, 200));
-
-  const verificationUrl = codeData.loginUrl;
-  const fpHash = codeData.fingerprintHash;
-  const expiresAt = codeData.expiresAt;
+  const serverFingerprintHash = codeData.fingerprintHash;
 
   // Step 2: Open browser
-  onUrl(verificationUrl);
-  await openBrowser(verificationUrl).catch(() => {});
+  onUrl(codeData.loginUrl);
+  await openBrowser(codeData.loginUrl).catch(() => {});
 
-  // Step 3: Poll for completion
+  // Step 3: Poll for completion (every 3s, up to 10 min)
   const deadline = Date.now() + 10 * 60 * 1000;
-
-  console.error(`[freebuff] waiting for sign-in at: ${verificationUrl}`);
-  console.error(`[freebuff] polling every 5s...`);
+  console.error(`[freebuff] waiting for sign-in at: ${codeData.loginUrl}`);
 
   while (Date.now() < deadline) {
     if (signal?.aborted) throw new Error("Sign-in cancelled.");
+    await sleep(3000);
 
-    await sleep(5000);
-
-    const statusUrl = `${region.website}/api/auth/cli/status?fingerprintId=${encodeURIComponent(fingerprintId)}&fingerprintHash=${encodeURIComponent(fpHash)}&expiresAt=${expiresAt}`;
+    const statusUrl = `${region.auth}/api/auth/cli/status?fingerprintId=${encodeURIComponent(fingerprintId)}&fingerprintHash=${encodeURIComponent(serverFingerprintHash)}&expiresAt=${codeData.expiresAt}`;
 
     try {
-      const statusRes = await fetch(statusUrl, { signal: AbortSignal.timeout(10_000) });
-
-      // Check Set-Cookie headers for session token
-      const setCookies = statusRes.headers.getSetCookie?.() ?? [];
-      for (const cookie of setCookies) {
-        const match = cookie.match(/next-auth\.session-token=([^;]+)/);
-        const secureMatch = cookie.match(/__Secure-next-auth\.session-token=([^;]+)/);
-        const token = match?.[1] ?? secureMatch?.[1];
-        if (token) {
-          console.error("[freebuff] sign-in complete (from cookie)!");
-          return token;
-        }
-      }
+      const statusRes = await fetch(statusUrl, {
+        headers: { "User-Agent": "Bun/1.3.11" },
+        signal: AbortSignal.timeout(10_000),
+      });
 
       if (statusRes.ok) {
-        const statusData = await statusRes.json() as Record<string, unknown>;
-        
-        // Binary returns { user: { id, email, name, authToken, ... }, message }
-        const user = statusData.user as Record<string, unknown> | undefined;
-        if (user) {
-          const token = user.authToken
-            ?? user.token
-            ?? user.session_token
-            ?? user.access_token;
-          if (typeof token === "string" && token) {
-            console.error("[freebuff] sign-in complete!");
-            return token;
-          }
-        }
-        
-        // Fallback: top-level token fields
-        const token = statusData.token
-          ?? statusData.authToken
-          ?? statusData.session_token
-          ?? statusData.access_token;
-        if (typeof token === "string" && token) {
-          console.error("[freebuff] sign-in complete!");
-          return token;
+        const data = await statusRes.json() as { user?: { authToken?: string; id?: string; name?: string; email?: string }; message?: string };
+        if (data.user?.authToken) {
+          console.error(`[freebuff] authenticated as ${data.user.name} (${data.user.email})`);
+          return {
+            authToken: data.user.authToken,
+            user: { id: data.user.id ?? "", name: data.user.name ?? "", email: data.user.email ?? "" },
+          };
         }
       }
-    } catch (e) {
+    } catch {
       if (signal?.aborted) throw new Error("Sign-in cancelled.");
     }
   }
 
-  throw new Error("Sign-in timed out (10 min). Please try again.");
+  throw new Error("Sign-in timed out (10 min).");
 }
 
-// ----------------------------------------------------------------------------
-// Browser opener
-// ----------------------------------------------------------------------------
+// ---- Browser opener ----
 
 async function openBrowser(url: string): Promise<void> {
   const cmds = process.platform === "darwin"
@@ -234,10 +175,6 @@ async function openBrowser(url: string): Promise<void> {
   }
   throw new Error(`Unable to open browser. Open this URL manually:\n  ${url}`);
 }
-
-// ----------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));

@@ -1,13 +1,10 @@
 /**
- * OpenAI-compatible HTTP proxy → Freebuff/Codebuff WebSocket.
- *
- * Binds at 127.0.0.1:42101 (or fallback port). Accepts standard
- * /v1/chat/completions and /v1/models requests, translates to
- * Freebuff's JSON-RPC 2.0 wire format over WebSocket.
+ * OpenAI-compatible HTTP proxy → Freebuff REST API.
+ * Binds at 127.0.0.1:42101. Accepts /v1/chat/completions and /v1/models.
  */
 import * as crypto from "crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "http";
-import { streamCloudChat, CloudChatError, type ChatMessage, type ToolDefinition, type StreamEvent, type CloudChatRequest } from "./chat";
+import { streamCloudChat, type ChatMessage, type ToolDefinition } from "./chat";
 import { resolveModel, getDefaultModel, setCatalog } from "./models";
 import { loadCredentials } from "./oauth";
 import { getAllModels, getCachedCatalog, type ModelCatalogEntry } from "./catalog";
@@ -17,12 +14,10 @@ const FREEBUFF_PROXY_PORT = 42101;
 
 export const PROXY_SECRET: string = crypto.randomBytes(32).toString("hex");
 
-export let proxyCredentials: { apiKey: string; backendUrl: string } | null = null;
-export function setProxyCredentials(creds: { apiKey: string; backendUrl: string } | null): void {
+export let proxyCredentials: { apiKey: string } | null = null;
+export function setProxyCredentials(creds: { apiKey: string } | null): void {
   proxyCredentials = creds;
 }
-
-// ---- Request types ----
 
 interface ChatCompletionRequest {
   model?: string;
@@ -54,8 +49,6 @@ function mapMessage(m: ChatCompletionRequest["messages"][number]): ChatMessage {
   } as ChatMessage;
 }
 
-// ---- Auth ----
-
 async function authorizeRequest(req: IncomingMessage): Promise<{ status: number; body: string; contentType: string } | null> {
   const authHeader = (req.headers.authorization ?? "") as string;
   if (!authHeader.startsWith("Bearer ")) {
@@ -63,15 +56,12 @@ async function authorizeRequest(req: IncomingMessage): Promise<{ status: number;
   }
   const presented = authHeader.slice("Bearer ".length);
   const presentedBuf = Buffer.from(presented, "utf8");
-
   const secretBuf = Buffer.from(PROXY_SECRET, "utf8");
   if (presentedBuf.length === secretBuf.length && crypto.timingSafeEqual(presentedBuf, secretBuf)) return null;
-
   if (proxyCredentials?.apiKey) {
     const credBuf = Buffer.from(proxyCredentials.apiKey, "utf8");
     if (presentedBuf.length === credBuf.length && crypto.timingSafeEqual(presentedBuf, credBuf)) return null;
   }
-
   try {
     const creds = loadCredentials();
     if (creds?.apiKey && creds.apiKey !== proxyCredentials?.apiKey) {
@@ -79,7 +69,6 @@ async function authorizeRequest(req: IncomingMessage): Promise<{ status: number;
       if (presentedBuf.length === credBuf.length && crypto.timingSafeEqual(presentedBuf, credBuf)) return null;
     }
   } catch {}
-
   return { status: 401, body: JSON.stringify({ error: { message: "Unauthorized: Invalid Bearer token.", type: "freebuff_error" } }), contentType: "application/json" };
 }
 
@@ -91,8 +80,6 @@ function getBody(req: IncomingMessage): Promise<string> {
     req.on("error", reject);
   });
 }
-
-// ---- Handler ----
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
@@ -111,13 +98,12 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // /v1/models
     if (url.pathname === "/v1/models" || url.pathname === "/models") {
       let allModels: ModelCatalogEntry[] = [];
       try {
         const creds = loadCredentials() ?? proxyCredentials;
         if (creds) {
-          const catalog = await getCachedCatalog(creds.apiKey, creds.backendUrl);
+          const catalog = await getCachedCatalog(creds.apiKey);
           if (catalog) allModels = [...catalog.byUid.values()];
         }
       } catch {}
@@ -128,7 +114,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       return;
     }
 
-    // /v1/chat/completions
     if (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions") {
       if (req.method !== "POST") {
         res.writeHead(405, { "Content-Type": "application/json" });
@@ -159,7 +144,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
       }
 
       const requestedModel = requestBody.model || getDefaultModel();
-      const resolved = await resolveModel(requestedModel, creds.apiKey, creds.backendUrl);
+      const resolved = await resolveModel(requestedModel, creds.apiKey);
 
       const tools: ToolDefinition[] = (requestBody.tools ?? []).map((t) => ({
         type: "function" as const,
@@ -176,14 +161,13 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
       if (proxyCredentials) {
         try {
-          const catalog = await getCachedCatalog(creds.apiKey, creds.backendUrl);
+          const catalog = await getCachedCatalog(creds.apiKey);
           if (catalog) setCatalog(catalog);
         } catch {}
       }
 
       if (isStreaming) {
         res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "Connection": "keep-alive" });
-
         const responseId = `chatcmpl-${crypto.randomUUID()}`;
         const abort = new AbortController();
         req.on("close", () => { if (!res.writableEnded) abort.abort(); });
@@ -191,8 +175,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         try {
           let firstChunkSent = false;
           let toolCallIndex = -1;
-          const toolIdToIndex = new Map<string, number>();
-          let lastToolCallId: string | undefined;
           let finishReason: string | null = null;
 
           const chunk = (delta: Record<string, unknown>) => ({
@@ -202,7 +184,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
           await streamCloudChat({
             apiKey: creds.apiKey,
-            backendUrl: creds.backendUrl,
             modelUid: resolved.modelUid,
             messages,
             tools: tools.length > 0 ? tools : undefined,
@@ -210,30 +191,23 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
             signal: abort.signal,
             callbacks: {
               onText: (text) => {
-                const delta = firstChunkSent ? { content: text } : { role: "assistant", content: text };
-                res.write(`data: ${JSON.stringify(chunk(delta))}\n\n`);
+                res.write(`data: ${JSON.stringify(chunk(firstChunkSent ? { content: text } : { role: "assistant", content: text }))}\n\n`);
                 firstChunkSent = true;
               },
               onThinking: (text) => {
-                const delta = firstChunkSent ? { reasoning: text } : { role: "assistant", reasoning: text };
-                res.write(`data: ${JSON.stringify(chunk(delta))}\n\n`);
+                res.write(`data: ${JSON.stringify(chunk(firstChunkSent ? { reasoning: text } : { role: "assistant", reasoning: text }))}\n\n`);
                 firstChunkSent = true;
               },
               onToolCall: (name, args) => {
                 toolCallIndex++;
                 const id = `call_${crypto.randomUUID().slice(0, 12)}`;
-                toolIdToIndex.set(id, toolCallIndex);
-                lastToolCallId = id;
-                const delta = firstChunkSent
-                  ? { tool_calls: [{ index: toolCallIndex, id, type: "function", function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) } }] }
-                  : { role: "assistant", tool_calls: [{ index: toolCallIndex, id, type: "function", function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) } }] };
-                res.write(`data: ${JSON.stringify(chunk(delta))}\n\n`);
+                const tcObj = { index: toolCallIndex, id, type: "function", function: { name, arguments: typeof args === "string" ? args : JSON.stringify(args) } };
+                res.write(`data: ${JSON.stringify(chunk(firstChunkSent ? { tool_calls: [tcObj] } : { role: "assistant", tool_calls: [tcObj] }))}\n\n`);
                 firstChunkSent = true;
               },
               onFinish: (reason) => {
                 finishReason = reason;
-                const finalReason = finishReason ?? (toolCallIndex >= 0 ? "tool_calls" : "stop");
-                res.write(`data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: finalReason }] })}\n\n`);
+                res.write(`data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: finishReason ?? "stop" }] })}\n\n`);
                 res.write("data: [DONE]\n\n");
                 res.end();
               },
@@ -241,7 +215,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
                 const msg = err instanceof Error ? err.message : "Unknown error";
                 try {
                   res.write(`data: ${JSON.stringify({ error: { message: msg } })}\n\n`);
-                  res.write(`data: ${JSON.stringify({ id: responseId, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: requestedModel, choices: [{ index: 0, delta: {}, finish_reason: "stop" as const }] })}\n\n`);
                   res.write("data: [DONE]\n\n");
                   res.end();
                 } catch {}
@@ -249,23 +222,21 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
             },
           });
         } catch (error) {
+          const msg = error instanceof Error ? error.message : "Unknown error";
           try {
-            const msg = error instanceof Error ? error.message : "Unknown error";
             res.write(`data: ${JSON.stringify({ error: { message: msg } })}\n\n`);
             res.write("data: [DONE]\n\n");
             res.end();
           } catch {}
         }
       } else {
-        // Non-streaming
         let collected = "";
         let finishReason = "stop";
         const toolCalls: Array<{ id: string; name: string; args: string }> = [];
-
         const abort = new AbortController();
+
         await streamCloudChat({
           apiKey: creds.apiKey,
-          backendUrl: creds.backendUrl,
           modelUid: resolved.modelUid,
           messages,
           tools: tools.length > 0 ? tools : undefined,
@@ -282,7 +253,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
         });
 
         if (toolCalls.length > 0 && finishReason === "stop") finishReason = "tool_calls";
-
         const assistantMessage = toolCalls.length > 0
           ? { role: "assistant" as const, content: collected, tool_calls: toolCalls.map((tc) => ({ id: tc.id, type: "function" as const, function: { name: tc.name, arguments: tc.args } })) }
           : { role: "assistant" as const, content: collected };
@@ -303,8 +273,6 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     try { res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message } })); } catch {}
   }
 }
-
-// ---- Server ----
 
 let serverInstance: ReturnType<typeof createServer> | null = null;
 

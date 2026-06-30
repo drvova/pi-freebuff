@@ -1,22 +1,18 @@
 /**
  * Freebuff Provider for Pi
  *
- * Enables Freebuff/Codebuff models via cloud-direct API.
- * Models are fetched from static catalog based on binary analysis.
- *
- * Usage: /freebuff-login → /model freebuff/<id>
+ * Enables Freebuff/Codebuff models via cloud-direct REST API.
+ * Auth via device code flow at freebuff.com.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { startProxy, stopProxy, PROXY_SECRET, setProxyCredentials } from "./proxy";
 import { loadCredentials, saveCredentials, deleteCredentials, DEFAULT_REGION, runLoginLoopback, type PersistedCredentials } from "./oauth";
-import { clearCachedToken } from "./auth";
 import { clearSessionIds } from "./chat";
 import { getAllModels, getCachedCatalog, clearCachedCatalog, type ModelCatalogEntry } from "./catalog";
 
 let _pi: ExtensionAPI | null = null;
 
-/** Build a Pi model definition from a catalog entry. */
 function catalogModelToPi(m: ModelCatalogEntry) {
   const ctx = m.contextWindow ?? 0;
   const maxOut = m.maxOutputTokens ?? 0;
@@ -36,53 +32,40 @@ function catalogModelToPi(m: ModelCatalogEntry) {
   };
 }
 
-/** Build dynamic model list from catalog. */
-async function buildDynamicModels(apiKey: string, backendUrl: string): Promise<ReturnType<typeof catalogModelToPi>[]> {
+async function buildDynamicModels(apiKey: string): Promise<ReturnType<typeof catalogModelToPi>[]> {
   try {
-    // Fetch live catalog from backend
-    const catalog = await getCachedCatalog(apiKey, backendUrl);
+    const catalog = await getCachedCatalog(apiKey);
     if (catalog && catalog.byUid.size > 0) {
-      const models = [...catalog.byUid.values()]
-        .filter((m) => !m.disabled)
-        .map(catalogModelToPi);
+      const models = [...catalog.byUid.values()].filter((m) => !m.disabled).map(catalogModelToPi);
       console.error(`[freebuff] loaded ${models.length} models from catalog`);
       return models;
     }
-    // Fallback to static list
-    const fallback = getAllModels().map(catalogModelToPi);
-    console.error(`[freebuff] using fallback catalog: ${fallback.length} models`);
-    return fallback;
   } catch (e) {
     console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
-    return getAllModels().map(catalogModelToPi);
   }
+  return getAllModels().map(catalogModelToPi);
 }
 
-// OAuth
 async function loginFreebuff(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  const token = await runLoginLoopback(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
-  if (!token) throw new Error("No token received.");
-
-  // Save credentials
+  const result = await runLoginLoopback(DEFAULT_REGION, (url) => callbacks.onAuth({ url }));
   const creds: PersistedCredentials = {
-    apiKey: token,
-    name: "freebuff-user",
-    apiServerUrl: DEFAULT_REGION.website,
-    backendUrl: DEFAULT_REGION.backendUrl,
+    apiKey: result.authToken,
+    name: result.user.name,
+    email: result.user.email,
+    apiServerUrl: DEFAULT_REGION.api,
+    backendUrl: DEFAULT_REGION.api,
     issuedAt: new Date().toISOString(),
     fingerprintId: "",
     fingerprintHash: "",
   };
   saveCredentials(creds);
-  setProxyCredentials({ apiKey: token, backendUrl: DEFAULT_REGION.backendUrl });
-  clearCachedToken();
+  setProxyCredentials({ apiKey: result.authToken });
   clearSessionIds();
-  return { refresh: token, access: token, expires: Date.now() + 365 * 24 * 60 * 60 * 1000 };
+  return { refresh: result.authToken, access: result.authToken, expires: Date.now() + 365 * 24 * 60 * 60 * 1000 };
 }
 
 async function refreshFreebuffToken(c: OAuthCredentials): Promise<OAuthCredentials> { return c; }
 
-// Extension entry
 export default async function (pi: ExtensionAPI) {
   _pi = pi;
 
@@ -91,18 +74,15 @@ export default async function (pi: ExtensionAPI) {
 
   let hasCreds = false;
   let apiKey = "";
-  let backendUrl = DEFAULT_REGION.backendUrl;
   try {
     const stored = loadCredentials();
     if (stored) {
-      setProxyCredentials({ apiKey: stored.apiKey, backendUrl: stored.backendUrl });
+      setProxyCredentials({ apiKey: stored.apiKey });
       hasCreds = true;
       apiKey = stored.apiKey;
-      backendUrl = stored.backendUrl;
     }
   } catch {}
 
-  // Register immediately with fallback models — fetch catalog async in background
   const fallbackModels = getAllModels().map(catalogModelToPi);
   pi.registerProvider("freebuff", {
     name: "Freebuff (Codebuff)",
@@ -119,48 +99,30 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  // Fetch live catalog in background (non-blocking)
   if (hasCreds) {
-    buildDynamicModels(apiKey, backendUrl).then((liveModels) => {
-      if (liveModels.length > 0) {
-        console.error(`[freebuff] catalog fetched: ${liveModels.length} models (restart to use)`);
-      }
-    }).catch((e) => {
-      console.error(`[freebuff] catalog fetch failed: ${e instanceof Error ? e.message : String(e)}`);
-    });
+    buildDynamicModels(apiKey).then((liveModels) => {
+      if (liveModels.length > 0) console.error(`[freebuff] catalog: ${liveModels.length} models (restart to use)`);
+    }).catch(() => {});
   }
 
-  console.error(hasCreds ? `[freebuff] connected — ${fallbackModels.length} models (live catalog loading in background)` : `[freebuff] /freebuff-login to connect`);
+  console.error(hasCreds ? `[freebuff] connected — ${fallbackModels.length} models` : `[freebuff] /freebuff-login to connect`);
 
   pi.registerCommand("freebuff-status", {
     description: "Show Freebuff auth status",
     handler: async (_args, ctx) => {
       const c = loadCredentials();
-      if (!c) {
-        ctx.ui.notify("Freebuff: not signed in. /freebuff-login", "warning");
-        return;
-      }
-      try {
-        const parts: string[] = [];
-        parts.push(`API Server: ${c.apiServerUrl}`);
-        parts.push(`Backend: ${c.backendUrl}`);
-        parts.push(`Token: ${c.apiKey.slice(0, 8)}...`);
-        parts.push(`Issued: ${c.issuedAt}`);
-        ctx.ui.notify(`Freebuff: ${parts.join(" | ")}`, "info");
-      } catch (e) {
-        ctx.ui.notify(`Freebuff: authenticated but status check failed: ${e instanceof Error ? e.message : String(e)}`, "warning");
-      }
+      if (!c) { ctx.ui.notify("Freebuff: not signed in. /freebuff-login", "warning"); return; }
+      ctx.ui.notify(`Freebuff: ${c.name} (${c.email}) | Token: ${c.apiKey.slice(0, 8)}...`, "info");
     },
   });
 
   pi.registerCommand("freebuff-logout", {
     description: "Sign out of Freebuff",
     handler: async (_args, ctx) => {
-      const ok = deleteCredentials();
+      deleteCredentials();
       setProxyCredentials(null);
-      clearCachedToken();
       clearSessionIds();
-      ctx.ui.notify(ok ? "Freebuff: signed out." : "Already signed out.", "info");
+      ctx.ui.notify("Freebuff: signed out.", "info");
     },
   });
 
@@ -171,13 +133,13 @@ export default async function (pi: ExtensionAPI) {
         clearCachedCatalog();
         const c = loadCredentials();
         if (c) {
-          const models = await buildDynamicModels(c.apiKey, c.backendUrl);
+          const models = await buildDynamicModels(c.apiKey);
           ctx.ui.notify(`Freebuff: refreshed ${models.length} models. Restart Pi to apply.`, "info");
         } else {
           ctx.ui.notify("Freebuff: not signed in. /freebuff-login", "warning");
         }
       } catch (e) {
-        ctx.ui.notify(`Freebuff: refresh error - ${e instanceof Error ? e.message : String(e)}`, "error");
+        ctx.ui.notify(`Freebuff: refresh error — ${e instanceof Error ? e.message : String(e)}`, "error");
       }
     },
   });
