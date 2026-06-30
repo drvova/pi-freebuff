@@ -1,159 +1,52 @@
-<p align="center">
-  <img src="https://github.com/drvova/pi-mcp-deferred/raw/master/pi-logo-animated.svg" alt="pi-freebuff" width="200">
-</p>
+# pi-freebuff
 
-<h1 align="center">pi-freebuff</h1>
-
-<p align="center">Use Freebuff/Codebuff models in <a href="https://github.com/earendil-works/pi">Pi</a> — DeepSeek, Kimi, MiniMax, Claude, GPT, Gemini, and more. All via your existing Freebuff subscription. No separate API keys.</p>
-
-## How it works
-
-Runs a local proxy at `127.0.0.1:42101` that speaks standard OpenAI Chat Completions API. Translates requests to Freebuff's proprietary JSON-RPC 2.0 wire format over WebSocket. Pi talks to the proxy via `api: "openai-completions"` — no custom streaming code needed.
-
-**Cloud-direct mode** talks straight to Freebuff's servers over WebSocket. No IDE installation, no background processes. The local proxy adds negligible overhead.
-
-```
-Pi → proxy (localhost:42101) → Freebuff Cloud
-```
+Free AI models (DeepSeek, Kimi, MiniMax, Mimo, Gemini, GLM) in [Pi](https://github.com/earendil-works/pi) via your freebuff.com account.
 
 ## Install
-
-**Option A — Git (recommended):**
 
 ```bash
 pi install git:github.com/drvova/pi-freebuff
 ```
 
-**Option B — npm:**
-
-```bash
-pi install npm:pi-freebuff
-```
-
-**Option C — Local dev:**
-
-```bash
-git clone https://github.com/drvova/pi-freebuff.git ~/developer/pi-freebuff
-pi -e ~/developer/pi-freebuff/index.ts
-```
-
 ## Setup
 
-### 1. Sign in
+1. `/freebuff-login` — opens browser, sign in with GitHub
+2. `/model` — pick a freebuff model
+3. Chat normally
 
-```
-/freebuff-login
-```
+## How it works
 
-Browser opens to codebuff.com. Sign in with your Freebuff account. Token captured automatically.
+Local HTTP proxy on `127.0.0.1:42101` translates OpenAI Chat Completions API → freebuff.com REST API. Handles auth, session lifecycle, run management, and thinking model compatibility.
 
-### 2. Pick a model
+## Models
 
-```
-/model freebuff/<model-id>
-```
+Catalog fetched dynamically from [Codebuff's freebuff-models.ts](https://raw.githubusercontent.com/CodebuffAI/codebuff/main/common/src/constants/freebuff-models.ts). Whatever the server makes available:
 
-Models shown are whatever your Freebuff plan enables.
-
-### 3. Chat
-
-Use Pi as normal. Your Freebuff subscription covers API costs.
+| Model | Notes |
+|-------|-------|
+| `deepseek/deepseek-v4-pro` | Thinking model |
+| `deepseek/deepseek-v4-flash` | Fast |
+| `minimax/minimax-m2.7` | |
+| `minimax/minimax-m3` | |
+| `moonshotai/kimi-k2.6` | |
+| `mimo/mimo-v2.5` | |
+| `mimo/mimo-v2.5-pro` | Actually Claude on backend |
+| `google/gemini-3.1-pro-preview` | |
+| `fireworks/deepseek-v4-flash` | Maps to deepseek-v4-flash |
 
 ## Commands
 
 | Command | Does |
 |---------|------|
-| `/freebuff-login` | Sign in (browser-based OAuth) |
+| `/freebuff-login` | Browser-based OAuth |
 | `/freebuff-status` | Show auth state |
 | `/freebuff-logout` | Sign out |
-| `/freebuff-refresh` | Refresh model list |
-
-## How models work
-
-Models are loaded from a static catalog based on binary analysis of the Freebuff/Codebuff CLI. The catalog includes:
-
-### OpenAI Models (Direct)
-- GPT-4.1, GPT-4o, GPT-4o Mini
-- o3, o3 Mini, o3 Pro
-
-### Anthropic Models (via OpenRouter)
-- Claude 3.5 Haiku, Claude 3.5 Sonnet
-- Claude Opus 4.1, Claude 4 Sonnet, Claude Sonnet 4.5
-
-### Google Models (via OpenRouter)
-- Gemini 2.5 Flash, Gemini 2.5 Pro
-
-### OpenAI GPT-5 Models (via OpenRouter)
-- GPT-5.1, GPT-5.1 Chat
-- GPT-4o, GPT-4o Mini, o3 Mini (OpenRouter variants)
-- GPT-4.1 Nano
-
-### Model Tags
-
-- **[Free]** — no pricing info = free on your plan
-- **[Thinking]** — supports extended thinking/reasoning
-
-### Zero hardcoding
-
-- No hardcoded model lists — catalog is defined statically
-- New models can be added by editing `catalog.ts`
-
-## Endpoints
-
-All traffic goes to `manicode-backend.onrender.com`:
-
-| Endpoint | Purpose |
-|----------|---------|
-| `POST /ws` | WebSocket JSON-RPC 2.0 streaming |
-| `GET /api/auth/cli/status` | Check auth status |
-| `POST /api/auth/cli/code` | Initiate CLI login |
-
-## Files
-
-```
-index.ts       Pi extension entry (provider registration + model building)
-proxy.ts       HTTP server (OpenAI API → JSON-RPC translation)
-chat.ts        WebSocket streaming (JSON-RPC encode/decode, SSE events)
-wire.ts        JSON-RPC 2.0 message builders
-catalog.ts     Static model catalog from binary analysis
-models.ts      Model resolution
-auth.ts        Token management
-metadata.ts    WebSocket metadata builder
-oauth.ts       Login loopback + RegisterUser
-```
 
 ## Requirements
 
 - Pi (any recent version)
-- Node.js >= 18 or Bun
-- Freebuff account (free or paid)
-
-No npm dependencies. Uses only Node built-ins and Pi's own types.
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                    PI-FREEBUFF ARCHITECTURE                       │
-│                                                                    │
-│  ┌─────────┐  HTTP /v1/chat/completions  ┌────────────────────┐  │
-│  │    Pi    │ ──────────────────────────> │   Local Proxy      │  │
-│  │ (coding  │ <────────────────────────── │   127.0.0.1:42101  │  │
-│  │  agent)  │       SSE streaming         │                    │  │
-│  └─────────┘                              │  proxy.ts          │  │
-│                                            │  chat.ts           │  │
-│                                            │  wire.ts           │  │
-│                                            └────────┬───────────┘  │
-│                                                     │              │
-│                                            JSON-RPC 2.0 over WS   │
-│                                                     │              │
-│                                                     v              │
-│                                            ┌──────────────────┐  │
-│                                            │ manicode-backend  │  │
-│                                            │ .onrender.com     │  │
-│                                            └──────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-```
+- Node.js >= 18
+- freebuff.com account (free)
 
 ## License
 
